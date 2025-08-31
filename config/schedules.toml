@@ -1,0 +1,6 @@
+timezone = "America/Indiana/Indianapolis"
+
+[jobs]
+arxiv = "07:30"
+news  = "08:00"
+

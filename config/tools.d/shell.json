@@ -1,0 +1,7 @@
+{
+  "server": "shell",
+  "tools": ["list_dir", "read_file", "which", "exec"],
+  "transport": "stdio",
+  "bin": "./target/debug/mcp-shell",
+  "autostart": true
+}

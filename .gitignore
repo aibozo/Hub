@@ -1,0 +1,27 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node (future PWA)
+node_modules/
+.next/
+dist/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Project storage (runtime outputs)
+storage/
+
+# Env
+.env
+

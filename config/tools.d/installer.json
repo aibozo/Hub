@@ -1,0 +1,6 @@
+{
+  "server": "installer",
+  "tools": ["plan_install", "explain_install", "dry_run", "apply_install"],
+  "transport": "stdio",
+  "bin": "python -m installer_server"
+}

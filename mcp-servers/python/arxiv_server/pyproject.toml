@@ -1,0 +1,15 @@
+[project]
+name = "arxiv-server"
+version = "0.0.1"
+description = "arXiv MCP server (scaffold)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "black"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+

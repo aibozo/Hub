@@ -1,0 +1,6 @@
+{
+  "server": "news",
+  "tools": ["daily_brief", "latest", "sources"],
+  "transport": "stdio",
+  "bin": "python -m news_server"
+}

@@ -1,0 +1,8 @@
+{
+  "server": "codex",
+  "tools": ["new", "continue"],
+  "transport": "stdio",
+  "bin": "./target/debug/mcp-codex",
+  "autostart": false
+}
+

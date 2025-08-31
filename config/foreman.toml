@@ -1,0 +1,19 @@
+[foreman]
+home = "./storage"
+profile = "default"
+
+[voice]
+wake_phrase = "hey vim"
+wake_enabled = true
+stt = { engine = "whisper.cpp", model = "medium" }
+tts = { engine = "piper", voice = "en_US-libritts-high" }
+realtime_endpoint = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+realtime_model = "gpt-realtime"
+realtime_voice = "alloy"
+
+[schedules]
+arxiv_brief = "07:30"
+news_brief  = "08:00"
+
+[mcp]
+servers = ["shell", "fs", "proc", "git", "arxiv", "news"]

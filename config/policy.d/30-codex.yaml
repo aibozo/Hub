@@ -1,0 +1,9 @@
+require_approval:
+  # Guard common risky operations Codex may request
+  - apply_patch
+  - "git apply"
+  - "git commit"
+  - "git rebase"
+  - "rm -rf"
+  - installer
+

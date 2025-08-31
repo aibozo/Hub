@@ -1,0 +1,2 @@
+[console_scripts]
+voice-daemon = voice_daemon.__main__:main

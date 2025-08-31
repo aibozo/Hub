@@ -1,0 +1,31 @@
+protect_paths:
+  - "/"
+  - "/etc"
+  - "/usr"
+  - "/var"
+  - "/boot"
+write_whitelist:
+  - "~/"
+  - "./"
+require_approval:
+  - sudo
+  - apt
+  - snap
+  - flatpak
+  - pip
+  - cargo
+  - "rm -rf"
+  - pkill
+  - iptables
+env_allowlist:
+  - PATH
+  - HOME
+  - LANG
+limits:
+  wall_time_sec: 120
+  cpu_percent: 80
+  mem_mb: 2048
+log_redactions:
+  - pattern: ".*TOKEN=.*"
+    replace: "TOKEN=***"
+

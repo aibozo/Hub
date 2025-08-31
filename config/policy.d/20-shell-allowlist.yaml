@@ -1,0 +1,37 @@
+# Shell execution allowlist for MCP 'shell.exec'
+# Rules are merged across all YAMLs in config/policy.d (lexicographic order).
+# Schema:
+# shell_allowlist:
+#   - match: <string>             # command basename or absolute path
+#     args:
+#       count: <int>              # exact number of args (optional)
+#       # or min_count/max_count instead of count
+#       path_prefixes: [<str>...] # all args must start with one of these prefixes (optional)
+
+shell_allowlist:
+  # Game Boy / GBA via mGBA
+  - match: mgba-qt
+    args:
+      count: 1
+      path_prefixes:
+        - "/home/kil/games/roms"
+
+  # Nintendo DS via melonDS AppImage (no args)
+  - match: "/home/kil/games/emulators/melonDS-x86_64.AppImage"
+    args:
+      count: 0
+  - match: "melonDS-x86_64.AppImage"
+    args:
+      count: 0
+
+  # Steam: launch by app id (steam -applaunch <APPID>)
+  - match: steam
+    args:
+      min_count: 2
+      starts_with_tokens: ["-applaunch"]
+      digits_at: 1
+  - match: "/usr/bin/steam"
+    args:
+      min_count: 2
+      starts_with_tokens: ["-applaunch"]
+      digits_at: 1

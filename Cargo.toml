@@ -1,0 +1,16 @@
+[workspace]
+members = [
+  "apps/assistant-core",
+  "apps/ui-tui",
+  "crates/foreman-types",
+  "crates/foreman-policy",
+  "crates/foreman-memory",
+  "crates/foreman-mcp",
+  "mcp-servers/rust/shell",
+  "mcp-servers/rust/fs",
+  "mcp-servers/rust/proc",
+  "mcp-servers/rust/git",
+  "mcp-servers/rust/codex",
+  "mcp-servers/rust/codex-mock",
+]
+resolver = "2"

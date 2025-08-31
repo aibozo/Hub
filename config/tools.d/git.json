@@ -1,0 +1,7 @@
+{
+  "server": "git",
+  "tools": ["status"],
+  "transport": "stdio",
+  "bin": "./target/debug/mcp-git",
+  "autostart": true
+}

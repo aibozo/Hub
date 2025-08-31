@@ -1,0 +1,9 @@
+#![cfg(feature = "tui")]
+pub mod chat;
+pub mod tasks;
+pub mod memory;
+pub mod tools;
+pub mod reports;
+pub mod dashboard;
+pub mod settings;
+pub mod codex;

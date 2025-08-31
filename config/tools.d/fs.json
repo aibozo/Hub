@@ -1,0 +1,7 @@
+{
+  "server": "fs",
+  "tools": ["stat", "list", "read"],
+  "transport": "stdio",
+  "bin": "./target/debug/mcp-fs",
+  "autostart": true
+}

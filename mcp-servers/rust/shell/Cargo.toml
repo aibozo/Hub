@@ -1,0 +1,22 @@
+[package]
+name = "mcp-shell"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+once_cell = "1.19"
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "io-std", "fs", "process"] }
+which = "6"
+foreman-mcp = { path = "../../../crates/foreman-mcp" }
+
+[lib]
+name = "mcp_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mcp-shell"
+path = "src/main.rs"

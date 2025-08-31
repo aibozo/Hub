@@ -1,0 +1,9 @@
+[games]
+"Overwatch 2" = "2357570"
+"No mans sky" = "275850"
+"Peak"        = "3527290"
+"Cyberpunk"   = "1091500"
+"Dishonored 2"= "403640"
+"Borderlands 2" = "397540"
+
+# Add new games as: "Name" = "APPID" (strings or integers both ok)

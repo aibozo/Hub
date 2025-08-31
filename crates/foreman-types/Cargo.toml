@@ -1,0 +1,11 @@
+[package]
+name = "foreman-types"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+name = "foreman_types"
+path = "src/lib.rs"
+
+[dependencies]
+

@@ -1,0 +1,15 @@
+pub mod api;
+pub mod app;
+pub mod config;
+pub mod gatekeeper;
+pub mod memory;
+pub mod mcp_client;
+pub mod scheduler;
+pub mod telemetry;
+pub mod system_map;
+pub mod tools;
+pub mod metrics;
+pub mod realtime;
+pub mod realtime_audio;
+pub mod wake;
+pub mod stt;

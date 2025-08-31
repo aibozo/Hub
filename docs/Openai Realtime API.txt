@@ -1,0 +1,556 @@
+Openai Realtime API
+Below is a practical, end‑to‑end reference for building an agent on **OpenAI’s Realtime WebSocket API** using the **`gpt‑realtime`** model. It covers how to connect, configure a session, stream audio in/out, handle **commits** and **turn detection**, mix **text + audio I/O**, and wire up **tool/function calls**. I’ve included working patterns (Node.js + Python), event flow diagrams, and pitfalls to avoid.
+
+> **What’s new (Aug 28, 2025):** `gpt‑realtime` is now GA with better instruction following, more natural voice, more reliable tool calling, new voices (**Marin, Cedar**), SIP phone connectivity, image inputs, and MCP support. Pricing was reduced vs. the earlier preview. ([OpenAI][1])
+
+---
+
+## 1) What you’re connecting to
+
+* **Model:** `gpt‑realtime` (GA). Supersedes older `gpt‑4o‑realtime‑preview` names. It’s a single **speech‑to‑speech** model: you stream audio in and get audio (and/or text) back with very low latency. ([OpenAI][1])
+* **Transport:** a persistent **WebSocket**. You send/receive JSON events (and base64 audio). ([OpenAI][2])
+* **Use cases:** real-time voice assistants, support agents, spoken task execution with tools, etc. ([OpenAI][2])
+
+---
+
+## 2) Quick mental model
+
+A Realtime session tracks two related things:
+
+1. **Session** — global settings for the model: voice, modalities, audio formats, VAD (turn detection), tools, etc. Controlled with `session.update`.
+2. **Conversation** — the running timeline of user + assistant “items” (messages, tool results, images). You add items with `conversation.item.create` and you **ask the model to reply** with `response.create`. ([OpenAI Cookbook][3])
+
+---
+
+## 3) Connect over WebSocket
+
+**Endpoint (server‑side or backend):**
+
+```
+wss://api.openai.com/v1/realtime?model=gpt-realtime
+```
+
+**Headers (required):**
+
+* `Authorization: Bearer <YOUR_API_KEY>`
+* `OpenAI-Beta: realtime=v1`  ← important for the realtime protocol. ([OpenAI Cookbook][3])
+
+**Code – Node.js (minimal):**
+
+```js
+import WebSocket from "ws";
+
+const url = "wss://api.openai.com/v1/realtime?model=gpt-realtime";
+const ws = new WebSocket(url, {
+  headers: {
+    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "OpenAI-Beta": "realtime=v1"
+  }
+});
+
+ws.on("open", () => console.log("connected"));
+ws.on("message", (data) => {
+  const evt = JSON.parse(data.toString());
+  // handle events here
+});
+```
+
+The server will emit `session.created` after a successful handshake; use this as your “ready” signal. ([OpenAI Cookbook][3])
+
+**Browser apps:** don’t put your secret in the client—mint a short‑lived **ephemeral client secret** and connect from the browser. The GA announcement shows `POST /v1/realtime/client_secrets` for this flow (and also introduces **MCP** tooling). ([OpenAI][1])
+
+---
+
+## 4) Configure the session (voice, modalities, audio formats, tools)
+
+Right after `session.created`, send a `session.update` describing how you want the model to behave:
+
+```jsonc
+{
+  "type": "session.update",
+  "session": {
+    "instructions": "You are a helpful, concise voice agent. Speak briskly.",
+    "voice": "marin",                // or cedar, alloy, onyx, shimmer, nova, fable, echo
+    "modalities": ["audio","text"],  // get audio + text back
+    "input_audio_format": "pcm16",   // raw 16‑bit little‑endian PCM
+    "output_audio_format": "pcm16",  // stream back as PCM16
+    "turn_detection": {"type": "server_vad", "threshold": 0.5},
+    "tools": [
+      {
+        "type": "function",
+        "name": "lookupOrder",
+        "description": "Find order status by id",
+        "parameters": {
+          "type":"object",
+          "properties": {"orderId":{"type":"string"}},
+          "required":["orderId"]
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }
+}
+```
+
+* **Voices:** GA adds **Marin** and **Cedar** and improves the existing voices’ quality. ([OpenAI][1])
+* **Modalities:** choose `["audio"]`, `["text"]`, or both. (Both is handy for captions/logging.) Practical examples show sessions configured for audio in/out and optional transcription. ([OpenAI Cookbook][3])
+* **Audio formats:** `pcm16` is the default/common choice for input & output; G.711 µ‑law/A‑law are also supported when doing pure realtime transcription (WS). ([OpenAI Cookbook][4])
+* **Turn detection (VAD):** set `server_vad` to auto‑detect when the user starts/stops talking; the server will commit the user’s audio turn for you (details below). ([OpenAI Cookbook][4])
+* **Tools:** add function specs with JSON Schema. You’ll get **tool call** events during a response; you then execute your function and feed the result back (see §8). The cookbook shows this exact flow with `session.update` + follow‑up `conversation.item.create` and `response.create`. ([OpenAI Cookbook][5])
+* **MCP & SIP:** GA adds remote **MCP** servers (the session can expose MCP tools automatically) and **SIP** phone calling support. ([OpenAI][1])
+
+---
+
+## 5) Send **audio input** (two patterns)
+
+### A) **Server VAD (recommended):** continuous stream, auto‑commit
+
+Send your mic frames continuously with `input_audio_buffer.append`, and let the server decide turns:
+
+```jsonc
+{ "type": "input_audio_buffer.append", "audio": "<base64 PCM16 bytes>" }
+```
+
+* The server emits **`input_audio_buffer.speech_started`** / **`speech_stopped`**, commits your buffer, creates a user **conversation item**, and you proceed to ask for a reply. You still send **`response.create`** to actually generate the assistant’s turn. ([OpenAI Cookbook][3])
+
+### B) **Manual commit:** you decide where the turn ends
+
+If you’re handling your own VAD / push‑to‑talk:
+
+1. Stream audio frames with `input_audio_buffer.append` (base64).
+2. When the utterance is done, send:
+
+```json
+{ "type": "input_audio_buffer.commit" }
+```
+
+3. Then **start the assistant’s reply**:
+
+```json
+{ "type": "response.create", "response": { "modalities": ["audio","text"] } }
+```
+
+> **Important:** `commit` by itself **does not** create a reply—you must send `response.create` to produce the assistant turn. This “commit‑then‑respond” pattern is consistently shown in official examples and forum guidance. ([OpenAI Cookbook][5], [OpenAI Community][6])
+
+**Audio framing tips (practical):**
+
+* Capture mono **PCM‑16** at **24 kHz** (commonly used in the examples). Chunk at \~**40 ms**; base64‑encode and send each chunk as an `input_audio_buffer.append` event. ([OpenAI Cookbook][3])
+
+---
+
+## 6) Ask the model to reply (and receive audio/text)
+
+To produce a turn, send:
+
+```jsonc
+{
+  "type": "response.create",
+  "response": {
+    "modalities": ["audio","text"],  // or ["audio"] / ["text"]
+    "instructions": "Keep it brief."
+    // optional: "conversation": "none"  // ad-hoc reply not stored in history
+  }
+}
+```
+
+While the assistant is speaking, you’ll receive a stream of events:
+
+* **`response.audio.delta`** — base64 PCM‑16 audio chunks every \~20–60 ms; append and play as they arrive.
+* **`response.output_text.delta`** — partial text (if you requested text).
+* **`response.done` / `response.completed`** — the assistant’s turn fully finished; includes usage stats and final text.
+* **`response.canceled`** — the response was interrupted/canceled.
+  Usage of these event types and their handling cadence are shown in the official Realtime cookbooks and developer forum. ([OpenAI Cookbook][3], [OpenAI Community][7])
+
+**Barge‑in (interrupt the assistant):** if the user starts talking over the assistant, call:
+
+```json
+{ "type": "response.cancel" }
+```
+
+and start buffering new user audio; this is the standard “barge‑in” pattern. ([OpenAI Community][8])
+
+---
+
+## 7) Mix **text input** (and images) with voice
+
+You can add non‑audio content to the conversation and then ask for a response:
+
+* **Text:**
+
+  ```jsonc
+  {
+    "type": "conversation.item.create",
+    "previous_item_id": null,
+    "item": {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "What's my order status?" }]
+    }
+  }
+  ```
+
+  Then send `response.create`. This pattern is used for system summaries and user messages in the cookbooks. ([OpenAI Cookbook][3])
+
+* **Image:** GA adds image input for Realtime. Send an image as a message content part:
+
+  ```jsonc
+  {
+    "type": "conversation.item.create",
+    "item": {
+      "type": "message",
+      "role": "user",
+      "content": [{
+        "type": "input_image",
+        "image_url": "data:image/png;base64,...."
+      }]
+    }
+  }
+  ```
+
+  Then `response.create`. ([OpenAI][1])
+
+---
+
+## 8) Tool/function calling (with real‑time voice)
+
+**Define tools in the session**, let the model decide when to call them, and stream the **function call** arguments as they’re generated. A practical flow (from the official cookbook):
+
+1. Add function specs in `session.update`.
+2. During a reply, you’ll receive events indicating a tool call (streaming arguments).
+3. **Execute** your function in your code.
+4. **Return the result** to the conversation as a new item of type `function_call_output` tied to the `call_id`.
+5. Send **`response.create`** to let the model incorporate the tool result and continue.
+
+The cookbook demonstrates steps **(4)** and **(5)** explicitly: it appends a `function_call_output` via `conversation.item.create`, then issues a `response.create` with (optionally) a “hint prompt” to steer summarization of the tool output. ([OpenAI Cookbook][5])
+
+> GA notes: function calling accuracy/ordering improved, and long‑running calls won’t block the ongoing dialog; the model can keep speaking while a tool finishes (asynchronous function calling). ([OpenAI][1])
+
+---
+
+## 9) Event cheat‑sheet
+
+**Client → Server** (you send):
+
+* `session.update` — set voice, modalities, formats, VAD, tools, instructions. ([OpenAI Cookbook][3])
+* `input_audio_buffer.append` — stream base64 audio frames. ([OpenAI Cookbook][3])
+* `input_audio_buffer.commit` — end of a user turn (manual mode). **Commit ≠ reply**. Follow with `response.create`. ([OpenAI Community][6])
+* `input_audio_buffer.clear` — discard any uncommitted audio (use if the user cancels mid‑utterance). ([OpenAI Community][9])
+* `conversation.item.create` — add text/image/tool output items. ([OpenAI Cookbook][5])
+* `response.create` — ask the model to generate output (audio/text). ([OpenAI Cookbook][5])
+* `response.cancel` — interrupt current speaking turn (barge‑in). ([OpenAI Community][8])
+
+**Server → Client** (you receive):
+
+* `session.created` / `session.updated` — handshake + confirmation of settings. ([OpenAI Cookbook][3])
+* `input_audio_buffer.speech_started` / `speech_stopped` — VAD boundaries. (Server VAD mode.) ([OpenAI Cookbook][4])
+* `conversation.item.created` / `conversation.item.retrieved` — user item created and later resolved with a transcript. ([OpenAI Cookbook][3])
+* `response.audio.delta` (and `response.output_text.delta`) — streaming audio (and text). ([OpenAI Cookbook][3])
+* `response.done` / `response.completed` — assistant turn finished; includes usage. ([OpenAI Cookbook][3], [OpenAI Community][7])
+* Tool‑call streaming events (e.g., function call arguments deltas) during tool invocation; then you return a `function_call_output` item. ([OpenAI Cookbook][5])
+
+---
+
+## 10) Putting it together — minimal flows
+
+### **Flow A: voice → voice with Server VAD (simplest)**
+
+1. Connect WS (`OpenAI-Beta: realtime=v1`). Wait for `session.created`. ([OpenAI Cookbook][3])
+2. `session.update` with `"modalities":["audio","text"]`, `"voice":"marin"`, `"turn_detection":{"type":"server_vad"}`. ([OpenAI Cookbook][3])
+3. Stream mic frames with `input_audio_buffer.append` (base64 PCM16). ([OpenAI Cookbook][3])
+4. After `speech_stopped` and user item creation, send `response.create`. (Commit is automatic in server VAD.) ([OpenAI Cookbook][4])
+5. Play `response.audio.delta` as they arrive; display text deltas if desired. When `response.done` arrives, the turn is complete. ([OpenAI Cookbook][3])
+
+### **Flow B: push‑to‑talk (manual commit)**
+
+1. Hold mic until the user releases the button.
+2. Send your buffered frames with `input_audio_buffer.append` and then **`input_audio_buffer.commit`**.
+3. Immediately send **`response.create`** to produce the answer. (Commit alone won’t generate a reply.) ([OpenAI Community][6])
+4. Handle `response.audio.delta` / `response.done`. ([OpenAI Cookbook][3])
+
+---
+
+## 11) Code patterns
+
+### Node.js — manual‑commit example (push‑to‑talk)
+
+```js
+import WebSocket from "ws";
+import fs from "fs";
+
+const ws = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-realtime", {
+  headers: {
+    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+    "OpenAI-Beta": "realtime=v1"
+  }
+});
+
+const b64 = buf => Buffer.from(buf).toString("base64");
+
+ws.on("open", async () => {
+  // 1) Configure session
+  ws.send(JSON.stringify({
+    type: "session.update",
+    session: {
+      instructions: "You are a concise voice agent. Speak briskly.",
+      voice: "marin",
+      modalities: ["audio","text"],
+      input_audio_format: "pcm16",
+      output_audio_format: "pcm16"
+    }
+  }));
+
+  // 2) Send a WAV/PCM16 snippet as a demo (use mic chunks in production)
+  const pcm = fs.readFileSync("./user_utterance.pcm"); // already 24kHz mono int16
+  // split into ~40ms frames
+  const frame = 24000 * 2 * 0.04; // samples/sec * bytes/sample * seconds
+  for (let i = 0; i < pcm.length; i += frame) {
+    ws.send(JSON.stringify({
+      type: "input_audio_buffer.append",
+      audio: b64(pcm.slice(i, i + frame))
+    }));
+  }
+
+  // 3) Commit + ask the model to reply (manual-commit pattern)
+  ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+  ws.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio","text"] }}));
+});
+
+// 4) Handle server events; play audio deltas with your audio stack
+ws.on("message", (data) => {
+  const ev = JSON.parse(data);
+  if (ev.type === "response.audio.delta") {
+    const raw = Buffer.from(ev.delta, "base64");
+    // feed to speaker/output…
+  } else if (ev.type === "response.output_text.delta") {
+    process.stdout.write(ev.delta);
+  } else if (ev.type === "response.done") {
+    console.log("\n[assistant turn complete]");
+  }
+});
+```
+
+This follows the **commit → response.create** rule and streams back audio + text. ([OpenAI Cookbook][3])
+
+### Python — streaming the mic with Server VAD (auto‑commit)
+
+```python
+import asyncio, base64, json, sounddevice as sd, websockets, os
+
+API_KEY = os.environ["OPENAI_API_KEY"]
+URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+HEADERS = {"Authorization": f"Bearer {API_KEY}", "OpenAI-Beta": "realtime=v1"}
+
+SAMPLE_RATE = 24000
+CHUNK_MS = 40
+BYTES_PER_SAMPLE = 2
+
+async def mic_to_ws(ws):
+    blocksize = int(SAMPLE_RATE * CHUNK_MS / 1000)
+    def cb(indata, frames, time, status):
+        try:
+            ws.send(json.dumps({
+                "type":"input_audio_buffer.append",
+                "audio": base64.b64encode(bytes(indata)).decode()
+            }))
+        except: pass
+    with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=blocksize, dtype="int16", channels=1, callback=cb):
+        await asyncio.Event().wait()
+
+async def main():
+    async with websockets.connect(URL, extra_headers=HEADERS, max_size=1<<24) as ws:
+        # wait for session.created
+        while json.loads(await ws.recv())["type"] != "session.created":
+            pass
+
+        await ws.send(json.dumps({
+          "type":"session.update",
+          "session":{
+            "voice":"marin",
+            "modalities":["audio","text"],
+            "input_audio_format":"pcm16",
+            "output_audio_format":"pcm16",
+            "turn_detection":{"type":"server_vad","threshold":0.5}
+          }
+        }))
+
+        # Start mic uploader
+        asyncio.create_task(mic_to_ws(ws))
+        print("Speak…")
+
+        # Whenever VAD stops a turn, ask for a reply
+        while True:
+            ev = json.loads(await ws.recv())
+            if ev["type"] == "input_audio_buffer.speech_stopped":
+                await ws.send(json.dumps({
+                    "type":"response.create",
+                    "response":{"modalities":["audio","text"]}
+                }))
+            elif ev["type"] == "response.output_text.delta":
+                print(ev["delta"], end="", flush=True)
+            elif ev["type"] == "response.done":
+                print("\n[assistant turn complete]")
+
+asyncio.run(main())
+```
+
+This mirrors the official cookbook patterns: **append** mic frames, let **Server VAD** auto‑commit the user turn, then **`response.create`** to speak back. ([OpenAI Cookbook][3])
+
+---
+
+## 12) Tool calls in practice (Realtime)
+
+A robust pattern (from the official cookbook):
+
+1. Define tools in `session.update`.
+2. As the model replies, listen for tool‑call events and accumulate streamed arguments.
+3. Execute your function.
+4. Send its result as:
+
+```jsonc
+{
+  "type": "conversation.item.create",
+  "previous_item_id": "<the tool_call item id>",
+  "item": {
+    "call_id": "<the tool_call id>",
+    "type": "function_call_output",
+    "output": "<stringified tool result>"
+  }
+}
+```
+
+5. Then:
+
+```json
+{ "type": "response.create" }
+```
+
+This exact “function\_call\_output → response.create” hand‑off is demonstrated in the cookbook’s data‑intensive guide. ([OpenAI Cookbook][5])
+
+---
+
+## 13) Handling **commits**, **turns**, and **state**
+
+* **Commit rule:** A commit (automatic via Server VAD, or manual with `input_audio_buffer.commit`) **finalizes a user turn** in the conversation but **does not** generate an assistant reply. Always follow with `response.create`. ([OpenAI Community][6])
+* **Clearing input:** If the user cancels mid‑turn, `input_audio_buffer.clear` discards buffered audio. ([OpenAI Community][9])
+* **Event cadence:** The cookbooks show a reliable sequence to maintain local state: wait for `conversation.item.created` (user turn), optionally `conversation.item.retrieved` for the final transcript, stream `response.audio.delta` / text deltas during the assistant turn, then `response.done`. ([OpenAI Cookbook][3])
+* **Large/long sessions:** The Realtime cookbooks demonstrate **conversation summarization** (periodically compress old turns into a short system message and delete old items) to keep the context window small and the dialog snappy. ([OpenAI Cookbook][3])
+
+---
+
+## 14) Text‑only and image‑augmented turns
+
+* You can intermix **typed** user messages (`input_text`) with microphone audio within the same conversation; then `response.create`. ([OpenAI Cookbook][3])
+* **Image inputs** can be added as `input_image` content parts; then `response.create`. Useful for “what do you see here?” tasks in a voice call. ([OpenAI][1])
+
+---
+
+## 15) Formats, limits & tips
+
+* **Audio in:** `pcm16` is the common path for speech agents; the cookbook notes real‑time WS transcription also supports **G.711 µ‑law/A‑law**—handy for telephony. ([OpenAI Cookbook][4])
+* **Chunking:** \~**40 ms** chunks at 24 kHz PCM‑16 is a proven cadence (encode to base64 per `append` event). ([OpenAI Cookbook][3])
+* **Sessions & stability:** The cookbook notes real‑time WS transcription sessions are time‑bounded (≤ \~30 minutes); reconnect if you run long. ([OpenAI Cookbook][4])
+* **Interruptibility:** call `response.cancel` to barge in while the assistant is speaking. ([OpenAI Community][8])
+* **Pricing (GA):** `gpt‑realtime` is available to all developers with \~20% lower audio token prices vs. the 2024 preview—**\$32 / 1M audio input tokens** and **\$64 / 1M audio output tokens**; text tokens priced separately. See the GA post for details. ([OpenAI][1])
+
+---
+
+## 16) Troubleshooting checklist
+
+* **“No events after connect”** → Verify the header `OpenAI-Beta: realtime=v1` and the `model` query param on the WS URL. Cookbook examples show both. ([OpenAI Cookbook][3])
+* **“Commit does nothing”** → That’s expected. After `input_audio_buffer.commit`, you **must** send `response.create`. ([OpenAI Community][6])
+* **“Can’t interrupt speech”** → send `response.cancel` as soon as user speech starts, then begin buffering the new user audio. ([OpenAI Community][8])
+* **“Tool results aren’t used”** → Ensure you attach the function output as a `function_call_output` item (with the matching `call_id`) **and** follow with `response.create`. ([OpenAI Cookbook][5])
+
+---
+
+## 17) Designing your agent
+
+* **State:** persist a light “conversation state” object locally (list of turns + item IDs). Fetch (`conversation.item.retrieved`) if a user transcript isn’t yet filled. Summarize/prune over time. ([OpenAI Cookbook][3])
+* **Voice style:** tune via `instructions` (e.g., “speak quickly and professionally”). GA’s `gpt‑realtime` adheres to fine‑grained voice instructions more reliably. ([OpenAI][1])
+* **Tool UX:** For data-heavy tools, push results as a `function_call_output` and immediately follow with a short “hint prompt” in the next `response.create` to guide what to extract (shown in the cookbook). ([OpenAI Cookbook][5])
+* **SIP & phone:** for call‑center style agents, GA includes native SIP support. ([OpenAI][1])
+
+---
+
+## 18) Copy‑paste templates (JSON events)
+
+**Append audio frame:**
+
+```json
+{ "type": "input_audio_buffer.append", "audio": "<base64 pcm16>" }
+```
+
+**Commit (manual):**
+
+```json
+{ "type": "input_audio_buffer.commit" }
+```
+
+**Ask for a reply:**
+
+```json
+{ "type": "response.create", "response": { "modalities": ["audio","text"] } }
+```
+
+**Cancel/interrupt current reply:**
+
+```json
+{ "type": "response.cancel" }
+```
+
+**Add tool result:**
+
+```json
+{
+  "type":"conversation.item.create",
+  "previous_item_id":"<tool_call_item_id>",
+  "item":{"type":"function_call_output","call_id":"<same_call_id>","output":"<stringified result>"}
+}
+```
+
+**Update session (voice, tools, etc.):**
+
+```json
+{
+  "type":"session.update",
+  "session":{"voice":"marin","modalities":["audio","text"],"...": "..."}
+}
+```
+
+---
+
+## 19) References & where specific details come from
+
+* GA announcement for **`gpt‑realtime`**, new voices, pricing, **MCP**, **SIP**, **image input**, and function‑calling improvements. ([OpenAI][1])
+* Original Realtime API announcement explaining WS architecture and tool calling. ([OpenAI][2])
+* Official **Realtime cookbooks** (hands‑on code) for:
+
+  * end‑to‑end voice session, event handling, `response.audio.delta`, state mgmt, **header** & WS URL usage. ([OpenAI Cookbook][3])
+  * function/tool call flow (`conversation.item.create` with `function_call_output` then `response.create`). ([OpenAI Cookbook][5])
+  * real‑time WS transcription specifics (formats including G.711, VAD, session timing, and headers). ([OpenAI Cookbook][4])
+  * conversation summarization & pruning pattern. ([OpenAI Cookbook][3])
+* Forum guidance/examples used to clarify:
+
+  * **Commit → response.create** pairing. ([OpenAI Community][6])
+  * **Interruptions** with `response.cancel`. ([OpenAI Community][8])
+  * `response.completed` naming in response lifecycle discussions. ([OpenAI Community][7])
+
+---
+
+### Final notes
+
+* If you want, I can tailor a **starter repository** (Node or Python) with: a voice loop (mic in, speaker out), text captions, barge‑in, and a pluggable tool layer (with a couple of example tools).
+* If you’re deploying to browsers, we’ll add the **ephemeral secret minting** route (per GA guidance) and post‑message IPC to the audio worker.
+
+If you share your preferred stack (Node/Python) and any tools your agent needs, I’ll produce a ready‑to‑run scaffold that adheres to the exact patterns above.
+
+[1]: https://openai.com/index/introducing-gpt-realtime/ "Introducing gpt-realtime and Realtime API updates for production voice agents | OpenAI"
+[2]: https://openai.com/index/introducing-the-realtime-api/ "Introducing the Realtime API | OpenAI"
+[3]: https://cookbook.openai.com/examples/context_summarization_with_realtime_api?utm_source=chatgpt.com "Context Summarization with Realtime API"
+[4]: https://cookbook.openai.com/examples/speech_transcription_methods?utm_source=chatgpt.com "Comparing Speech-to-Text Methods with the OpenAI API"
+[5]: https://cookbook.openai.com/examples/data-intensive-realtime-apps?utm_source=chatgpt.com "Practical guide to data-intensive apps with the Realtime API"
+[6]: https://community.openai.com/t/problems-using-session-update-with-the-realtime-api-issue-with-input-audio-transcription/977195?utm_source=chatgpt.com "Problems using session.update with the realtime-api (issue ..."
+[7]: https://community.openai.com/t/does-the-metadata-field-in-response-api-appear-in-webhook-payloads/1347054?utm_source=chatgpt.com "Does the metadata field in Response API appear ..."
+[8]: https://community.openai.com/t/not-able-to-interupt-realtime-ai-response/1250662?utm_source=chatgpt.com "Not able to interupt realtime ai response - API"
+[9]: https://community.openai.com/t/realtime-api-input-audio-tokens-exploding/1349602?utm_source=chatgpt.com "Realtime API, input audio tokens exploding"
+

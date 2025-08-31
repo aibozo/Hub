@@ -1,0 +1,7 @@
+{
+  "server": "proc",
+  "tools": ["list"],
+  "transport": "stdio",
+  "bin": "./target/debug/mcp-proc",
+  "autostart": true
+}

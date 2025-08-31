@@ -1,0 +1,5 @@
+# Customize policy locally; see docs/POLICY.md for schema.
+protect_paths: []
+write_whitelist: []
+require_approval: []
+
