@@ -411,7 +411,6 @@ impl RealtimeManager {
                         "input_audio_format": "pcm16",
                         "output_audio_format": out_fmt,
                         "turn_detection": { "type": "server_vad" },
-                        "input_audio_transcription": { "enabled": true, "model": std::env::var("REALTIME_TRANSCRIBE_MODEL").unwrap_or_else(|_| "gpt-4o-mini-transcribe".into()) },
                         "tools": crate::tools::realtime_tool_schemas(&tools)
                     }
                 });
@@ -423,7 +422,19 @@ impl RealtimeManager {
                     "[cfg] capture_sr={}Hz, capture_chunk_ms={}, output_sr={}Hz, out_fmt={}",
                     cap_sr, 40, srv_out_sr, out_fmt
                 ));
-                rt_log(format!("-> session.update {} bytes", upd_txt.len()));
+                // Log a short preview of instructions for debugging
+                let preview = if upd_txt.len() > 0 {
+                    // try to pull the instructions value length and head
+                    match serde_json::from_str::<serde_json::Value>(&upd_txt) {
+                        Ok(v) => v.get("session").and_then(|s| s.get("instructions")).and_then(|i| i.as_str()).map(|t| {
+                            let mut head = t.to_string();
+                            if head.len() > 120 { head.truncate(120); head.push('…'); }
+                            format!("(instr {} chars) {}", t.len(), head)
+                        }).unwrap_or_default(),
+                        Err(_) => String::new(),
+                    }
+                } else { String::new() };
+                rt_log(format!("-> session.update {} bytes {}", upd_txt.len(), preview));
                 if ws.send(Message::Text(upd_txt)).await.is_err() {
                     let mut g = inner.write();
                     g.status.last_error = Some("send session.update failed".into());
