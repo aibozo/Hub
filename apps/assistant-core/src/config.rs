@@ -17,11 +17,27 @@ pub struct VoiceConfig {
     #[serde(default)]
     pub tts: serde_json::Value,
     #[serde(default)]
+    pub porcupine: Option<PorcupineConfig>,
+    #[serde(default)]
     pub realtime_endpoint: Option<String>,
     #[serde(default)]
     pub realtime_model: Option<String>,
     #[serde(default)]
     pub realtime_voice: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PorcupineConfig {
+    /// Path to keyword .ppn file (preferred). If not set, keyword_dir will be scanned for first .ppn.
+    pub keyword_path: Option<String>,
+    /// Directory to scan for .ppn if keyword_path is not provided.
+    pub keyword_dir: Option<String>,
+    /// Optional path to porcupine model .pv file
+    pub model_path: Option<String>,
+    /// 0.0..1.0 sensitivity (default 0.5)
+    pub sensitivity: Option<f32>,
+    /// Env var name holding the access key (default PICOVOICE_ACCESS_KEY)
+    pub access_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

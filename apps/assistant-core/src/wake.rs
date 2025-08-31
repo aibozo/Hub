@@ -8,6 +8,8 @@ use std::collections::VecDeque;
 use tokio::sync::mpsc;
 #[cfg(feature = "realtime-audio")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "realtime-audio")]
+use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
 fn wake_log(line: impl AsRef<str>) {
     let line = line.as_ref();
@@ -69,7 +71,7 @@ impl WakeSentinel {
             if !opts.enabled { wake_log("wake: disabled at start; not listening"); return; }
             wake_log(format!("wake: starting (enabled=true, sr=16000, chunk=30ms, phrase=\"{}\")", opts.phrase));
             // Start capture in a dedicated thread to avoid Send bounds; deliver frames via tokio mpsc
-            let (tx_frames, mut rx_frames) = mpsc::channel::<Vec<i16>>(16);
+            let (tx_frames, mut rx_frames) = mpsc::channel::<Vec<i16>>(64);
             let stop_flag = Arc::new(AtomicBool::new(false));
             let stop_for_thread = stop_flag.clone();
             std::thread::spawn(move || {
@@ -82,40 +84,111 @@ impl WakeSentinel {
                     Err(e) => { eprintln!("[wake] capture error: {}", e); }
                 }
             });
-            let mut last_trigger = std::time::Instant::now() - std::time::Duration::from_millis(opts.refractory_ms);
+            let last_trigger = StdArc::new(StdMutex::new(std::time::Instant::now() - std::time::Duration::from_millis(opts.refractory_ms)));
             let mut ring: VecDeque<i16> = VecDeque::with_capacity(16000 * 3);
+            #[cfg(feature = "wake-porcupine")]
+            let mut porcupine = {
+                // Read Porcupine paths from env for now; later wire config
+                let mut keyword_path = std::env::var("PORCUPINE_KEYWORD_PATH").unwrap_or_else(|_| String::new());
+                if keyword_path.is_empty() {
+                    if let Ok(dir) = std::env::var("PORCUPINE_KEYWORD_DIR") {
+                        if let Ok(rd) = std::fs::read_dir(dir) {
+                            for e in rd.flatten() {
+                                if let Some(ext) = e.path().extension().and_then(|s| s.to_str()) { if ext.eq_ignore_ascii_case("ppn") { if let Some(s) = e.path().to_str() { keyword_path = s.to_string(); break; } } }
+                            }
+                        }
+                    }
+                }
+                let model_path = std::env::var("PORCUPINE_MODEL_PATH").ok();
+                let access_key_env = std::env::var("PORCUPINE_ACCESS_KEY_ENV").unwrap_or_else(|_| "PICOVOICE_ACCESS_KEY".into());
+                let sensitivity: f32 = std::env::var("PORCUPINE_SENSITIVITY").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5);
+                if keyword_path.is_empty() { wake_log("wake: PORCUPINE_KEYWORD_PATH not set; wake disabled"); }
+                match crate::wake_porcupine::PorcupineDetector::new(crate::wake_porcupine::PorcupineOpts { access_key_env, keyword_path, model_path, sensitivity }) {
+                    Ok(det) => { wake_log(format!("wake: Porcupine ready (sr={}Hz, frame_length={})", det.sample_rate, det.frame_length)); det }
+                    Err(e) => { wake_log(format!("wake: Porcupine init error: {}", e)); return; }
+                }
+            };
+            #[cfg(feature = "wake-porcupine")]
+            let mut porcupine_buf: Vec<i16> = Vec::with_capacity(1024);
             let mut in_speech = false;
             let mut speech_len_ms: u32 = 0;
             let mut phrase_buf: Vec<i16> = vec![];
+            let mut silence_ms: u32 = 0;
+            // Dynamic energy threshold based on sensitivity (0..1)
+            let thr: f32 = 0.005 + (0.025 * opts.vad_sensitivity.clamp(0.0, 1.0));
+            wake_log(format!("wake: VAD threshold set to {:.3}", thr));
             loop {
                 tokio::select! {
                     _ = &mut rx_stop => { stop_flag.store(true, Ordering::SeqCst); break; }
                     Some(frame) = rx_frames.recv() => {
                         // Maintain ring buffer (3s)
                         for s in &frame { if ring.len()>=16000*3 { ring.pop_front(); } ring.push_back(*s); }
+                        // Porcupine path (if enabled)
+                        #[cfg(feature = "wake-porcupine")]
+                        {
+                            porcupine_buf.extend_from_slice(&frame);
+                            while porcupine_buf.len() >= porcupine.frame_length {
+                                let chunk: Vec<i16> = porcupine_buf.drain(0..porcupine.frame_length).collect();
+                                match porcupine.process(&chunk) {
+                                    Ok(true) => {
+                                        let mut permit = false;
+                                        let now = std::time::Instant::now();
+                                        if let Ok(mut g) = last_trigger.lock() { if now.duration_since(*g).as_millis() as u64 >= opts.refractory_ms { *g = now; permit = true; } }
+                                        if permit {
+                                            wake_log("wake: Porcupine detected — starting realtime session");
+                                            let _ = realtime.start(crate::realtime::RealtimeOptions { model: Some("gpt-realtime".into()), voice: Some("alloy".into()), audio: Some(crate::realtime::RealtimeAudioOpts { in_sr: Some(16000), out_format: Some("pcm16".into()) }), instructions: None, endpoint: None, transport: None }).await;
+                                        } else {
+                                            wake_log("wake: detection suppressed by refractory window");
+                                        }
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => { wake_log(format!("wake: Porcupine error: {}", e)); }
+                                }
+                            }
+                            continue;
+                        }
                         // VAD energy
                         let energy: f32 = frame.iter().map(|s| s.abs() as f32 / 32768.0).sum::<f32>() / (frame.len().max(1) as f32);
-                        let thr: f32 = 0.010; // fixed threshold
                         if energy > thr {
-                            in_speech = true; speech_len_ms += 30; phrase_buf.extend_from_slice(&frame);
+                            in_speech = true; speech_len_ms += 30; silence_ms = 0; phrase_buf.extend_from_slice(&frame);
                         } else {
-                            if in_speech {
+                            // accumulate silence, require at least 150ms to close speech
+                            silence_ms += 30;
+                            if in_speech && silence_ms >= 150 {
                                 // Speech ended
                                 in_speech = false;
                                 if speech_len_ms >= opts.min_speech_ms {
-                                    // Transcribe and match wake phrase
-                                    wake_log(format!("wake: speech ended ({} ms) — transcribing", speech_len_ms));
-                                    let t0 = std::time::Instant::now();
-                                    let text = transcribe(&phrase_buf, 16000).await;
-                                    let dt = t0.elapsed().as_millis();
-                                    if !text.is_empty() { wake_log(format!("wake: transcript=\"{}\" ({} ms)", text, dt)); } else { wake_log(format!("wake: empty transcript ({} ms)", dt)); }
-                                    if matches_wake(&text, &opts.phrase) && last_trigger.elapsed().as_millis() as u64 >= opts.refractory_ms {
-                                        wake_log("wake: phrase matched — starting realtime session");
-                                        let _ = realtime.start(crate::realtime::RealtimeOptions { model: Some("gpt-realtime".into()), voice: Some("alloy".into()), audio: Some(crate::realtime::RealtimeAudioOpts { in_sr: Some(16000), out_format: Some("pcm16".into()) }), instructions: None, endpoint: None, transport: None }).await;
-                                        last_trigger = std::time::Instant::now();
-                                    }
+                                    // Offload STT to background; don't block capture loop
+                                    let audio = std::mem::take(&mut phrase_buf);
+                                    let p = opts.phrase.clone();
+                                    let rt = realtime.clone();
+                                    let last_tr = last_trigger.clone();
+                                    let ref_ms = opts.refractory_ms;
+                                    tokio::spawn(async move {
+                                        wake_log(format!("wake: speech ended ({} ms) — transcribing (bg)", speech_len_ms));
+                                        let t0 = std::time::Instant::now();
+                                        let text = transcribe(&audio, 16000).await;
+                                        let dt = t0.elapsed().as_millis();
+                                        if !text.is_empty() { wake_log(format!("wake: transcript=\"{}\" ({} ms)", text, dt)); } else { wake_log(format!("wake: empty transcript ({} ms)", dt)); }
+                                        // Gate by refractory and phrase match
+                                        let now = std::time::Instant::now();
+                                        if matches_wake(&text, &p) {
+                                            // Check refractory without holding the lock across await
+                                            let mut permit = false;
+                                            if let Ok(mut g) = last_tr.lock() {
+                                                if now.duration_since(*g).as_millis() as u64 >= ref_ms { *g = now; permit = true; }
+                                            }
+                                            if permit {
+                                                wake_log("wake: phrase matched — starting realtime session");
+                                                let _ = rt.start(crate::realtime::RealtimeOptions { model: Some("gpt-realtime".into()), voice: Some("alloy".into()), audio: Some(crate::realtime::RealtimeAudioOpts { in_sr: Some(16000), out_format: Some("pcm16".into()) }), instructions: None, endpoint: None, transport: None }).await;
+                                            } else {
+                                                wake_log("wake: match suppressed by refractory window");
+                                            }
+                                        }
+                                    });
                                 }
-                                speech_len_ms = 0; phrase_buf.clear();
+                                // reset accumulators
+                                speech_len_ms = 0; phrase_buf.clear(); silence_ms = 0;
                             }
                         }
                     }

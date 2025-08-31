@@ -10,6 +10,8 @@ tts = { engine = "piper", voice = "en_US-libritts-high" }
 realtime_endpoint = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
 realtime_model = "gpt-realtime"
 realtime_voice = "alloy"
+porcupine = { keyword_path = "${PORCUPINE_KEYWORD_PATH}", model_path = "${PORCUPINE_MODEL_PATH}", sensitivity = 0.5, access_key_env = "PICOVOICE_ACCESS_KEY" }
+vad_sensitivity = 0.2
 
 [schedules]
 arxiv_brief = "07:30"

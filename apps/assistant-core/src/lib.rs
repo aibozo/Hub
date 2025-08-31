@@ -12,4 +12,6 @@ pub mod metrics;
 pub mod realtime;
 pub mod realtime_audio;
 pub mod wake;
+#[cfg(feature = "wake-porcupine")]
+pub mod wake_porcupine;
 pub mod stt;
