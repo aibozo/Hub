@@ -113,6 +113,10 @@ async def run_server(host: str, port: int):
                 "loading": _stt_loading,
             })
 
+        async def wake_health_handler(request: web.Request):
+            info = wake.snapshot() if wake else {"running": False, "ready": False}
+            return web.json_response(info)
+
         async def ws_handler(request: web.Request):
             ws = web.WebSocketResponse()
             await ws.prepare(request)
@@ -161,6 +165,7 @@ async def run_server(host: str, port: int):
         app.router.add_get("/v1/tts/health", health_handler)
         app.router.add_get("/v1/tts/stream", ws_handler)
         app.router.add_get("/v1/stt/health", stt_health_handler)
+        app.router.add_get("/v1/wake/health", wake_health_handler)
         app.router.add_post("/v1/stt/transcribe", stt_transcribe_handler)
         # Optionally preload model in background
         if HAVE_WHISPER and os.environ.get("WHISPER_PRELOAD", "1") not in ("0","false","False"):
@@ -201,6 +206,14 @@ async def run_server(host: str, port: int):
                         "device": _stt_device,
                         "loading": _stt_loading,
                     }).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.startswith("/v1/wake/health"):
+                    info = wake.snapshot() if wake else {"running": False, "ready": False}
+                    body = json.dumps(info).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))

@@ -9,6 +9,9 @@ Provides-Extra: servers
 Requires-Dist: aiohttp>=3.9; extra == "servers"
 Requires-Dist: websockets>=12; extra == "servers"
 Requires-Dist: numpy>=1.24; extra == "servers"
+Requires-Dist: pvporcupine>=3.0.0; extra == "servers"
+Requires-Dist: sounddevice>=0.4.6; extra == "servers"
+Requires-Dist: requests>=2.31.0; extra == "servers"
 
 Voice Daemon (TTS/STT)
 ======================

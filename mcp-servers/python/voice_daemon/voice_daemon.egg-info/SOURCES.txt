@@ -7,6 +7,7 @@ voice_daemon/engine_base.py
 voice_daemon/router.py
 voice_daemon/schemas.py
 voice_daemon/server.py
+voice_daemon/wake.py
 voice_daemon.egg-info/PKG-INFO
 voice_daemon.egg-info/SOURCES.txt
 voice_daemon.egg-info/dependency_links.txt

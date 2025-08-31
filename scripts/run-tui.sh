@@ -115,6 +115,12 @@ check_voice_ready() {
 }
 
 # Start voice-daemon if not running
+if [ -n "${PICOVOICE_ACCESS_KEY:-}" ]; then
+  log "Porcupine: PICOVOICE_ACCESS_KEY present"
+else
+  log "Porcupine: PICOVOICE_ACCESS_KEY missing (set it in .env)"
+fi
+
 if check_voice_ready; then
   log "voice-daemon already running at ${VOICE_BASE}"
 else

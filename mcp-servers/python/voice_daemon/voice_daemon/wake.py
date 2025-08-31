@@ -25,6 +25,16 @@ class WakeThread:
         self._thr = None
         self.base_url = base_url.rstrip('/')
         self.refractory_ms = refractory_ms
+        self.status = {
+            "running": False,
+            "ready": False,
+            "keyword": None,
+            "sensitivity": None,
+            "frame_length": None,
+            "sample_rate": None,
+            "last_detect_ms": None,
+            "error": None,
+        }
 
     def start(self):
         if self._thr and self._thr.is_alive():
@@ -40,10 +50,12 @@ class WakeThread:
     def _run(self):
         if not HAVE_PV or not HAVE_SD:
             print("voice-daemon: wake disabled (pvporcupine or sounddevice not available)")
+            self.status.update({"running": False, "ready": False, "error": "missing deps"})
             return
         access_key = os.environ.get(os.environ.get("PORCUPINE_ACCESS_KEY_ENV", "PICOVOICE_ACCESS_KEY")) or os.environ.get("PICOVOICE_ACCESS_KEY")
         if not access_key:
             print("voice-daemon: wake disabled (PICOVOICE_ACCESS_KEY not set)")
+            self.status.update({"running": False, "ready": False, "error": "no access key"})
             return
         keyword_path = os.environ.get("PORCUPINE_KEYWORD_PATH")
         if not keyword_path:
@@ -56,6 +68,7 @@ class WakeThread:
                         break
         if not keyword_path:
             print("voice-daemon: wake disabled (no keyword .ppn found)")
+            self.status.update({"running": False, "ready": False, "error": "no keyword"})
             return
         model_path = os.environ.get("PORCUPINE_MODEL_PATH")
         sensitivity = float(os.environ.get("PORCUPINE_SENSITIVITY", "0.5"))
@@ -63,8 +76,18 @@ class WakeThread:
             porcupine = pvporcupine.create(access_key=access_key, keyword_paths=[keyword_path], model_path=model_path, sensitivities=[sensitivity])
         except Exception as e:
             print(f"voice-daemon: Porcupine init error: {e}")
+            self.status.update({"running": False, "ready": False, "error": str(e)})
             return
         print(f"voice-daemon: Porcupine loaded (sr={porcupine.sample_rate}Hz, frame={porcupine.frame_length}, keyword={os.path.basename(keyword_path)})")
+        self.status.update({
+            "running": True,
+            "ready": True,
+            "keyword": os.path.basename(keyword_path),
+            "sensitivity": sensitivity,
+            "frame_length": porcupine.frame_length,
+            "sample_rate": porcupine.sample_rate,
+            "error": None,
+        })
         last = 0.0
         try:
             with sd.RawInputStream(samplerate=porcupine.sample_rate, blocksize=porcupine.frame_length, dtype='int16', channels=1) as stream:
@@ -79,6 +102,7 @@ class WakeThread:
                             if (now - last) * 1000.0 >= self.refractory_ms:
                                 print("voice-daemon: wake detected → calling core /api/realtime/start")
                                 last = now
+                                self.status.update({"last_detect_ms": int(now * 1000.0)})
                                 try:
                                     body = {
                                         "voice": os.environ.get("FOREMAN_REALTIME_VOICE", "alloy"),
@@ -96,3 +120,5 @@ class WakeThread:
             except Exception:
                 pass
 
+    def snapshot(self):
+        return dict(self.status)
