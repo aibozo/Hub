@@ -893,10 +893,11 @@ async fn handle_command(mut app: &mut App, cmd: String) {
         {
             let (rts, err) = net::realtime_status().await.unwrap_or((false, None));
             let ws = net::wake_status().await.unwrap_or(serde_json::json!({}));
+            let wd = net::wake_daemon_status().await.unwrap_or(serde_json::json!({}));
             app.rt_active = rts;
             let rt = if rts {"active"} else {"idle"};
             let err_txt = err.map(|e| format!(" • err: {}", e)).unwrap_or_default();
-            app.status = format!("realtime: {}{} • wake: {}", rt, err_txt, ws);
+            app.status = format!("realtime: {}{} • wake(core): {} • wake(daemon): {}", rt, err_txt, ws, wd);
             push_toast(&mut app, "Updated voice status", ToastKind::Info);
             return;
         }
@@ -1600,6 +1601,10 @@ pub mod net {
     // Wake endpoints
     pub async fn wake_status() -> anyhow::Result<serde_json::Value> {
         let v: serde_json::Value = reqwest::get("http://127.0.0.1:6061/api/wake/status").await?.json().await?;
+        Ok(v)
+    }
+    pub async fn wake_daemon_status() -> anyhow::Result<serde_json::Value> {
+        let v: serde_json::Value = reqwest::get("http://127.0.0.1:7071/v1/wake/health").await?.json().await?;
         Ok(v)
     }
     pub async fn wake_enable() -> anyhow::Result<()> {
