@@ -130,7 +130,12 @@ impl WakeSentinel {
 
 async fn transcribe(_pcm: &[i16], _sr: u32) -> String {
     if std::env::var("OPENAI_API_KEY").is_ok() {
-        if let Ok(t) = crate::stt::transcribe_openai_pcm16(_pcm, _sr).await { return t; }
+        match crate::stt::transcribe_openai_pcm16(_pcm, _sr).await {
+            Ok(t) => return t,
+            Err(e) => { wake_log(format!("wake: STT error: {}", e)); return String::new(); }
+        }
+    } else {
+        wake_log("wake: OPENAI_API_KEY not set; STT disabled (wake phrase cannot be recognized)");
     }
     String::new()
 }

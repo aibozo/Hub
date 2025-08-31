@@ -7,6 +7,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 cd "$ROOT_DIR"
 
+: "${FOREMAN_ENV_FILE:=.env}"
+# Load environment from .env if present (API keys, etc.)
+if [ -f "$FOREMAN_ENV_FILE" ]; then
+  # export all vars in the file (simple KEY=VALUE lines)
+  set -a
+  # shellcheck disable=SC1090
+  source "$FOREMAN_ENV_FILE"
+  set +a
+fi
+
 : "${FOREMAN_BIND:=127.0.0.1:6061}"
 READY_URL="http://${FOREMAN_BIND}/ready"
 
