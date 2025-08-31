@@ -20,6 +20,11 @@ fi
 : "${FOREMAN_BIND:=127.0.0.1:6061}"
 READY_URL="http://${FOREMAN_BIND}/ready"
 
+: "${VOICE_HOST:=127.0.0.1}"
+: "${VOICE_PORT:=7071}"
+VOICE_BASE="http://${VOICE_HOST}:${VOICE_PORT}"
+VOICE_READY_URL="${VOICE_BASE}/v1/tts/health"
+
 log() { echo "[tui-run] $*"; }
 
 have_curl=0
@@ -40,9 +45,16 @@ ensure_logs_dir() {
 
 CORE_PID=""
 OWNED_CORE=0
+VOICE_PID=""
+OWNED_VOICE=0
 
 cleanup() {
   local code=$?
+  if [ "$OWNED_VOICE" -eq 1 ] && [ -n "$VOICE_PID" ] && kill -0 "$VOICE_PID" >/dev/null 2>&1; then
+    log "Stopping voice-daemon (pid=$VOICE_PID)"
+    kill "$VOICE_PID" 2>/dev/null || true
+    sleep 0.1 || true
+  fi
   if [ "$OWNED_CORE" -eq 1 ] && [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" >/dev/null 2>&1; then
     log "Stopping assistant-core (pid=$CORE_PID)"
     # Try graceful SIGINT first (tokio::signal::ctrl_c)
@@ -91,6 +103,38 @@ else
     log "--- tail of core log ---"
     tail -n 200 "$LOG_FILE" || true
     exit 1
+  fi
+fi
+
+check_voice_ready() {
+  if [ $have_curl -eq 1 ]; then
+    curl -fsS --max-time 1 "$VOICE_READY_URL" >/dev/null 2>&1 && return 0 || return 1
+  else
+    : >/dev/tcp/"${VOICE_HOST}"/"${VOICE_PORT}" && return 0 || return 1
+  fi
+}
+
+# Start voice-daemon if not running
+if check_voice_ready; then
+  log "voice-daemon already running at ${VOICE_BASE}"
+else
+  ensure_logs_dir
+  TS="$(date +%Y%m%d-%H%M%S)"
+  VLOG_FILE="storage/logs/voice-daemon-${TS}.log"
+  if command -v python >/dev/null 2>&1; then
+    log "Starting voice-daemon at ${VOICE_BASE} (logs: $VLOG_FILE)"
+    ( VOICE_HOST="$VOICE_HOST" VOICE_PORT="$VOICE_PORT" python -m voice_daemon ) >>"$VLOG_FILE" 2>&1 &
+    VOICE_PID=$!
+    OWNED_VOICE=1
+    for i in {1..60}; do
+      if check_voice_ready; then break; fi
+      sleep 0.5
+    done
+    if ! check_voice_ready; then
+      log "Warning: voice-daemon did not become ready at $VOICE_READY_URL; wake STT may be unavailable"
+    fi
+  else
+    log "Warning: Python not found; cannot start voice-daemon"
   fi
 fi
 

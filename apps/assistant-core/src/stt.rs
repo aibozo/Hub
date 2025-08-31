@@ -50,3 +50,19 @@ pub async fn transcribe_openai_pcm16(pcm: &[i16], sr: u32) -> Result<String> {
     Ok(text)
 }
 
+pub async fn transcribe_local_pcm16(pcm: &[i16], sr: u32, endpoint: Option<&str>) -> Result<String> {
+    let url = endpoint.map(|s| s.to_string()).unwrap_or_else(|| std::env::var("LOCAL_STT_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:7071/v1/stt/transcribe".into()));
+    let client = reqwest::Client::new();
+    // Body is raw PCM16 little-endian, mono
+    let mut bytes = Vec::with_capacity(pcm.len()*2);
+    for s in pcm { bytes.extend_from_slice(&s.to_le_bytes()); }
+    let resp = client.post(&url).header("content-type","application/octet-stream").header("x-sample-rate", sr.to_string()).body(bytes).send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        anyhow::bail!(format!("local stt http {}: {}", status, txt));
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    Ok(text)
+}
