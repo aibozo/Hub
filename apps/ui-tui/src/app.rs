@@ -274,6 +274,14 @@ pub async fn run() -> anyhow::Result<()> {
                         } else if let Some(e) = err {
                             if app.status.starts_with("realtime: starting") || was_active { app.status = format!("realtime error: {}", e); push_toast(&mut app, format!("Realtime error: {}", e), ToastKind::Error); }
                         }
+                        // Refresh chat messages from latest session so voice transcripts show up live
+                        if let Ok(Some(sess)) = net::chat_latest().await {
+                            if app.chat_session_id.as_deref() != Some(&sess.id) {
+                                app.chat_session_id = Some(sess.id.clone());
+                            }
+                            app.chat_messages = sess.messages;
+                            app.chat_scroll = 0;
+                        }
                     }
                     Err(_) => {}
                 }

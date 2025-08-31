@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use std::collections::VecDeque;
 use futures_util::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -110,6 +111,7 @@ async fn handle_ws_message(
                 }
                 if typ == "input_audio_buffer.speech_started" || typ.ends_with("speech_started") {
                     rt_log("<- speech_started");
+                    // Mark that a user utterance started (no-op for now; ring always accumulates)
                 }
                 // Server-side user transcription (preferred): accumulate and flush
                 if (typ.contains("input_audio_buffer") && typ.contains("transcription") && typ.ends_with("delta")) || typ == "input_audio_buffer.transcription.delta" {
@@ -146,6 +148,23 @@ async fn handle_ws_message(
                     rt_log("<- speech_stopped; -> response.create [audio,text]");
                     let create = serde_json::json!({"type":"response.create","response": {"modalities":["audio","text"]}});
                     let _ = ws.send(Message::Text(create.to_string())).await;
+                    // Also produce a local transcript for chat logging (best-effort)
+                    if let Some(dir) = chat_dir.as_ref() {
+                        let samples: Vec<i16> = {
+                            let g = inner.read();
+                            let take = (in_sr as usize) * 4; // last 4s
+                            let n = g.ring.len();
+                            let start = n.saturating_sub(take);
+                            g.ring.iter().skip(start).cloned().collect()
+                        };
+                        if !samples.is_empty() {
+                            let dir = dir.clone();
+                            tokio::spawn(async move {
+                                let t = transcribe_user_local(&samples, in_sr).await;
+                                if !t.is_empty() { let _ = append_latest_chat_message(&dir, "user", &t).await; }
+                            });
+                        }
+                    }
                     return;
                 }
                 if typ == "tool.call" || typ == "tool_call" {
@@ -257,6 +276,8 @@ struct InnerState {
     // Accumulators for chat logging
     user_text_buf: String,
     assistant_text_buf: String,
+    // Recent mic audio ring buffer for local STT
+    ring: VecDeque<i16>,
 }
 
 #[derive(Clone)]
@@ -271,7 +292,7 @@ pub struct RealtimeManager {
 impl Default for RealtimeManager {
     fn default() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new() })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), ring: VecDeque::with_capacity(16000*8) })),
             tools: crate::tools::ToolsManager::default(),
             policy: Arc::new(crate::gatekeeper::PolicyEngine::default()),
             approval_prompt: Arc::new(RwLock::new(None)),
@@ -283,7 +304,7 @@ impl Default for RealtimeManager {
 impl RealtimeManager {
     pub fn new(tools: crate::tools::ToolsManager, policy: Arc<crate::gatekeeper::PolicyEngine>, approval_prompt: Arc<RwLock<Option<crate::app::EphemeralApproval>>>, chat_dir: Option<PathBuf>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new() })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), ring: VecDeque::with_capacity(16000*8) })),
             tools,
             policy,
             approval_prompt,
@@ -451,6 +472,13 @@ impl RealtimeManager {
                             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {},
                             Some(frame) = rx_frames.recv() => {
                                 let pcm = frame;
+                                // Push into recent ring for local STT (keep ~8s)
+                                {
+                                    let mut g = inner.write();
+                                    for s in &pcm { g.ring.push_back(*s); }
+                                    let max_samples = (cap_sr as usize) * 8;
+                                    while g.ring.len() > max_samples { g.ring.pop_front(); }
+                                }
                                 // Half-duplex: if assistant is speaking, drop mic frames to avoid barge-in
                                 if inner.read().playing_audio {
                                     rt_log("(drop) mic frame during playback");
@@ -702,6 +730,19 @@ async fn append_latest_chat_message(dir: &PathBuf, role: &str, content: &str) ->
     let data = serde_json::to_vec_pretty(&v)?;
     tokio::fs::write(&path, data).await?;
     Ok(())
+}
+
+async fn transcribe_user_local(pcm: &[i16], sr: u32) -> String {
+    // Try local voice-daemon STT first, fallback to OpenAI if available
+    match crate::stt::transcribe_local_pcm16(pcm, sr, None).await {
+        Ok(t) if !t.is_empty() => return t,
+        Ok(_) => {},
+        Err(e) => { rt_log(format!("stt(local) error: {}", e)); }
+    }
+    if std::env::var("OPENAI_API_KEY").is_ok() {
+        match crate::stt::transcribe_openai_pcm16(pcm, sr).await { Ok(t) => return t, Err(e) => { rt_log(format!("stt(openai) error: {}", e)); } }
+    }
+    String::new()
 }
 
 fn last_user_utterance(dir: &PathBuf) -> Option<String> {
