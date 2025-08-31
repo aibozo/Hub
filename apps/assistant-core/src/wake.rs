@@ -129,21 +129,13 @@ impl WakeSentinel {
 }
 
 async fn transcribe(_pcm: &[i16], _sr: u32) -> String {
-    // Prefer local whisper.cpp if configured; else fall back to OpenAI STT
-    let have_local = std::env::var("WHISPER_CPP_BIN").is_ok() && std::env::var("WHISPER_CPP_MODEL").is_ok();
-    if have_local {
-        match crate::stt::transcribe_whisper_cpp(_pcm, _sr) {
-            Ok(t) => return t,
-            Err(e) => { wake_log(format!("wake: whisper.cpp error: {}", e)); }
-        }
-    }
     if std::env::var("OPENAI_API_KEY").is_ok() {
         match crate::stt::transcribe_openai_pcm16(_pcm, _sr).await {
             Ok(t) => return t,
             Err(e) => { wake_log(format!("wake: STT error: {}", e)); }
         }
-    } else if !have_local {
-        wake_log("wake: no STT available — set WHISPER_CPP_BIN/WHISPER_CPP_MODEL or OPENAI_API_KEY");
+    } else {
+        wake_log("wake: OPENAI_API_KEY not set; STT disabled (wake phrase cannot be recognized)");
     }
     String::new()
 }
