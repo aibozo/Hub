@@ -33,7 +33,6 @@ tungstenite = { version = "0.23", optional = true, default-features = false, fea
 cpal = { version = "0.15", optional = true }
 ringbuf = { version = "0.2", optional = true }
 base64 = { version = "0.22", optional = true }
-pv_porcupine = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -49,4 +48,4 @@ path = "src/lib.rs"
 default = []
 realtime = ["tokio-tungstenite", "tungstenite"]
 realtime-audio = ["cpal", "ringbuf", "base64"]
-wake-porcupine = ["pv_porcupine"]
+wake-porcupine = []

@@ -21,6 +21,7 @@ except Exception:
 from .audio import SAMPLE_RATE, CHANNELS, pcm_chunks
 from .router import select_engine
 from .schemas import Health
+from .wake import WakeThread, HAVE_PV, HAVE_SD
 
 try:
     import numpy as np
@@ -80,6 +81,17 @@ def get_stt_model():
 
 async def run_server(host: str, port: int):
     engine = select_engine()
+    # Setup wake thread (Porcupine) if enabled
+    wake = None
+    try:
+        if os.environ.get("WAKE_ENABLED", "1") not in ("0", "false", "False") and HAVE_PV and HAVE_SD:
+            base = os.environ.get("FOREMAN_BASE", f"http://127.0.0.1:6061")
+            refrac = int(os.environ.get("WAKE_REFRACTORY_MS", "3000"))
+            wake = WakeThread(base, refractory_ms=refrac)
+        else:
+            print("voice-daemon: wake disabled or dependencies missing")
+    except Exception as e:
+        print(f"voice-daemon: wake init error: {e}")
 
     if HAVE_AIOHTTP:
         app = web.Application()
@@ -160,6 +172,8 @@ async def run_server(host: str, port: int):
         await runner.setup()
         site = web.TCPSite(runner, host, port)
         print(f"voice-daemon (aiohttp) listening on http://{host}:{port}")
+        if wake:
+            wake.start()
         await site.start()
         while True:
             await asyncio.sleep(3600)
@@ -257,4 +271,6 @@ async def run_server(host: str, port: int):
         httpd = HTTPServer((host, port), Handler)
 
         loop = asyncio.get_running_loop()
+        if wake:
+            wake.start()
         await loop.run_in_executor(None, httpd.serve_forever)
