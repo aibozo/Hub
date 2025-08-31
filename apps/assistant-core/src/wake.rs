@@ -43,7 +43,7 @@ struct Inner {
 
 impl Default for WakeOptions {
     fn default() -> Self {
-        Self { phrase: "hey vim".into(), enabled: false, vad_sensitivity: 0.5, min_speech_ms: 400, refractory_ms: 3000 }
+        Self { phrase: "hey vim".into(), enabled: true, vad_sensitivity: 0.5, min_speech_ms: 400, refractory_ms: 3000 }
     }
 }
 

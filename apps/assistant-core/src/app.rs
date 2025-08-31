@@ -86,7 +86,7 @@ impl AppState {
         let vc = config.voice.clone();
         let wake_opts = WakeOptions {
             phrase: vc.as_ref().and_then(|v| v.wake_phrase.clone()).unwrap_or_else(|| "hey vim".into()),
-            enabled: vc.as_ref().and_then(|v| v.wake_enabled).unwrap_or(false),
+            enabled: vc.as_ref().and_then(|v| v.wake_enabled).unwrap_or(true),
             vad_sensitivity: vc.as_ref().and_then(|v| v.vad_sensitivity).unwrap_or(0.5),
             min_speech_ms: vc.as_ref().and_then(|v| v.min_speech_ms).unwrap_or(400),
             refractory_ms: vc.as_ref().and_then(|v| v.refractory_ms).unwrap_or(3000) as u64,
