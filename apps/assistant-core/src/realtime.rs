@@ -142,8 +142,10 @@ async fn handle_ws_message(
                     return;
                 }
                 if typ == "input_audio_buffer.speech_stopped" || typ.ends_with("speech_stopped") {
-                    // With semantic_vad.create_response=true, the server will create the response.
-                    rt_log("<- speech_stopped (server will create response)");
+                    // Server VAD signaled end of user turn; request a response
+                    rt_log("<- speech_stopped; -> response.create [audio,text]");
+                    let create = serde_json::json!({"type":"response.create","response": {"modalities":["audio","text"]}});
+                    let _ = ws.send(Message::Text(create.to_string())).await;
                     return;
                 }
                 if typ == "tool.call" || typ == "tool_call" {
@@ -398,25 +400,18 @@ impl RealtimeManager {
                 #[cfg(feature = "realtime-audio")]
                 let _cap_keepalive = match crate::realtime_audio::start_capture(cap_sr, 40, tx_frames) { Ok(c) => Some(c), Err(e) => { eprintln!("[realtime] audio capture init error: {}", e); None } };
 
-                // Build session.update per current OpenAI Realtime docs
+                // Build session.update with fields supported by OpenAI Realtime WS
                 let payload = serde_json::json!({
                     "type": "session.update",
                     "session": {
-                        "type": "realtime",
                         "model": model,
                         "instructions": instructions,
-                        "output_modalities": ["audio","text"],
-                        "audio": {
-                            "input": {
-                                "format": "pcm16",
-                                "turn_detection": { "type": "semantic_vad", "create_response": true }
-                            },
-                            "output": {
-                                "format": out_fmt,
-                                "voice": voice,
-                                "speed": 1.0
-                            }
-                        },
+                        "voice": voice,
+                        "modalities": ["audio","text"],
+                        "input_audio_format": "pcm16",
+                        "output_audio_format": out_fmt,
+                        "turn_detection": { "type": "server_vad" },
+                        "input_audio_transcription": { "enabled": true, "model": std::env::var("REALTIME_TRANSCRIBE_MODEL").unwrap_or_else(|_| "gpt-4o-mini-transcribe".into()) },
                         "tools": crate::tools::realtime_tool_schemas(&tools)
                     }
                 });
