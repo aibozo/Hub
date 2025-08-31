@@ -33,19 +33,48 @@ try:
 except Exception:
     whisper = None
     HAVE_WHISPER = False
+try:
+    import torch
+except Exception:
+    torch = None
 
 _stt_model = None
+_stt_device = None
+_stt_loading = False
 
 def get_stt_model():
     global _stt_model
+    global _stt_device
+    global _stt_loading
     if _stt_model is None and HAVE_WHISPER:
         model_name = os.environ.get("WHISPER_MODEL", "base.en")
+        # Select device: env override or auto-detect
+        device = os.environ.get("WHISPER_DEVICE")
+        if device is None:
+            if torch is not None and hasattr(torch, 'cuda') and torch.cuda.is_available():
+                device = 'cuda'
+            elif torch is not None and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
         try:
-            _stt_model = whisper.load_model(model_name)
-            print(f"voice-daemon: loaded whisper model '{model_name}'")
+            _stt_loading = True
+            _stt_model = whisper.load_model(model_name, device=device)
+            _stt_device = device
+            msg = f"voice-daemon: loaded whisper model '{model_name}' on device '{device}'"
+            if device == 'cuda' and torch is not None:
+                try:
+                    name = torch.cuda.get_device_name(0)
+                    msg += f" (GPU: {name})"
+                except Exception:
+                    pass
+            print(msg)
         except Exception as e:
             print(f"voice-daemon: failed to load whisper model '{model_name}': {e}")
             _stt_model = None
+            _stt_device = None
+        finally:
+            _stt_loading = False
     return _stt_model
 
 
@@ -60,13 +89,16 @@ async def run_server(host: str, port: int):
             return web.json_response(h.__dict__)
 
         async def stt_health_handler(request: web.Request):
-            ready = HAVE_WHISPER and get_stt_model() is not None and np is not None
+            # Do not block on model load here; just report current state
+            ready = HAVE_WHISPER and (_stt_model is not None) and (np is not None)
             return web.json_response({
                 "ok": True,
                 "stt_ready": bool(ready),
                 "have_whisper": bool(HAVE_WHISPER),
                 "have_numpy": bool(np is not None),
                 "model": os.environ.get("WHISPER_MODEL", "base.en"),
+                "device": _stt_device,
+                "loading": _stt_loading,
             })
 
         async def ws_handler(request: web.Request):
@@ -105,6 +137,9 @@ async def run_server(host: str, port: int):
                 # Transcribe
                 lang = request.query.get("language") or os.environ.get("WHISPER_LANG")
                 opts = {"language": lang} if lang else {}
+                # Use fp16 on CUDA only for speed; CPU/MPS prefer fp32
+                if _stt_device in (None, 'cpu', 'mps'):
+                    opts["fp16"] = False
                 res = model.transcribe(arr, **opts)
                 text = res.get("text", "")
                 return web.json_response({"text": text})
@@ -115,6 +150,12 @@ async def run_server(host: str, port: int):
         app.router.add_get("/v1/tts/stream", ws_handler)
         app.router.add_get("/v1/stt/health", stt_health_handler)
         app.router.add_post("/v1/stt/transcribe", stt_transcribe_handler)
+        # Optionally preload model in background
+        if HAVE_WHISPER and os.environ.get("WHISPER_PRELOAD", "1") not in ("0","false","False"):
+            async def _preload():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, get_stt_model)
+            asyncio.create_task(_preload())
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host, port)
@@ -136,13 +177,15 @@ async def run_server(host: str, port: int):
                     self.end_headers()
                     self.wfile.write(body)
                 elif self.path.startswith("/v1/stt/health"):
-                    ready = HAVE_WHISPER and get_stt_model() is not None and np is not None
+                    ready = HAVE_WHISPER and (_stt_model is not None) and np is not None
                     body = json.dumps({
                         "ok": True,
                         "stt_ready": bool(ready),
                         "have_whisper": bool(HAVE_WHISPER),
                         "have_numpy": bool(np is not None),
                         "model": os.environ.get("WHISPER_MODEL", "base.en"),
+                        "device": _stt_device,
+                        "loading": _stt_loading,
                     }).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -192,7 +235,10 @@ async def run_server(host: str, port: int):
                         data = self.rfile.read(length)
                         arr = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                         lang = None
-                        res = model.transcribe(arr, **({"language": lang} if lang else {}))
+                        opts = {"language": lang} if lang else {}
+                        if _stt_device in (None, 'cpu', 'mps'):
+                            opts["fp16"] = False
+                        res = model.transcribe(arr, **opts)
                         text = res.get("text", "")
                         body = json.dumps({"text": text}).encode("utf-8")
                         self.send_response(200)

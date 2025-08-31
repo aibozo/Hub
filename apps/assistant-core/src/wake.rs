@@ -105,8 +105,10 @@ impl WakeSentinel {
                                 if speech_len_ms >= opts.min_speech_ms {
                                     // Transcribe and match wake phrase
                                     wake_log(format!("wake: speech ended ({} ms) — transcribing", speech_len_ms));
+                                    let t0 = std::time::Instant::now();
                                     let text = transcribe(&phrase_buf, 16000).await;
-                                    if !text.is_empty() { wake_log(format!("wake: transcript=\"{}\"", text)); }
+                                    let dt = t0.elapsed().as_millis();
+                                    if !text.is_empty() { wake_log(format!("wake: transcript=\"{}\" ({} ms)", text, dt)); } else { wake_log(format!("wake: empty transcript ({} ms)", dt)); }
                                     if matches_wake(&text, &opts.phrase) && last_trigger.elapsed().as_millis() as u64 >= opts.refractory_ms {
                                         wake_log("wake: phrase matched — starting realtime session");
                                         let _ = realtime.start(crate::realtime::RealtimeOptions { model: Some("gpt-realtime".into()), voice: Some("alloy".into()), audio: Some(crate::realtime::RealtimeAudioOpts { in_sr: Some(16000), out_format: Some("pcm16".into()) }), instructions: None, endpoint: None, transport: None }).await;
