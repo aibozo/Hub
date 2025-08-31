@@ -73,19 +73,32 @@ async fn handle_ws_message(
                             let gain: f32 = std::env::var("REALTIME_PLAYBACK_GAIN").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.25).clamp(0.0, 1.0);
                             if gain != 1.0 { for s in pcm.iter_mut() { let v = (*s as f32) * gain; *s = v.clamp(i16::MIN as f32, i16::MAX as f32) as i16; } }
                             if let Some(pb) = playback { pb.push_pcm(&pcm, in_sr); }
+                            // Accumulate assistant audio for possible STT
+                            {
+                                let mut g = inner.write();
+                                g.assistant_pcm.extend_from_slice(&pcm);
+                            }
                         }
                     }
                     return;
                 }
                 // Accumulate assistant text deltas; flush on response.done
-                if typ.ends_with("output_text.delta") || typ == "response.output_text.delta" || typ == "response.text.delta" {
+                if typ.ends_with("output_text.delta") || typ.ends_with("text.delta") || typ == "response.output_text.delta" || typ == "response.text.delta" {
                     if let Some(delta) = v.get("delta").and_then(|s| s.as_str()).or_else(|| v.get("text").and_then(|s| s.as_str())) {
                         let mut g = inner.write();
                         g.assistant_text_buf.push_str(delta);
                     }
                     return;
                 }
-                if typ.ends_with("output_text.done") || typ.ends_with("response.done") || typ == "response.completed" {
+                // Also support audio transcript events when server streams them
+                if typ.ends_with("audio_transcript.delta") || typ == "response.audio_transcript.delta" {
+                    if let Some(delta) = v.get("delta").and_then(|s| s.as_str()).or_else(|| v.get("text").and_then(|s| s.as_str())) {
+                        let mut g = inner.write();
+                        g.assistant_text_buf.push_str(delta);
+                    }
+                    return;
+                }
+                if typ.ends_with("output_text.done") || typ.ends_with("text.done") || typ.ends_with("audio_transcript.done") || typ.ends_with("response.done") || typ == "response.completed" {
                     // Flush assistant text buffer to chat
                     let text = {
                         let mut g = inner.write();
@@ -101,12 +114,26 @@ async fn handle_ws_message(
                     let mut g = inner.write();
                     if g.playing_audio { rt_log("[state] assistant done speaking"); }
                     g.playing_audio = false;
+                    // If no text was flushed, attempt STT on assistant audio for chat logging
+                    let have_text = !g.assistant_text_buf.is_empty();
+                    let pcm: Vec<i16> = if have_text { vec![] } else { std::mem::take(&mut g.assistant_pcm) };
+                    drop(g);
+                    if !have_text && !pcm.is_empty() {
+                        if let Some(dir) = chat_dir.as_ref() {
+                            let dir = dir.clone();
+                            tokio::spawn(async move {
+                                let t = transcribe_user_local(&pcm, in_sr).await; // reuse same STT
+                                if !t.is_empty() { let _ = append_latest_chat_message(&dir, "assistant", &t).await; }
+                            });
+                        }
+                    }
                     return;
                 }
                 if typ.ends_with("response.created") || typ.ends_with("response.output_item.added") {
                     let mut g = inner.write();
                     if !g.playing_audio { rt_log("[state] response started"); }
                     g.playing_audio = true;
+                    g.assistant_pcm.clear();
                     // fall through to normal processing/logging
                 }
                 if typ == "input_audio_buffer.speech_started" || typ.ends_with("speech_started") {
@@ -222,6 +249,11 @@ async fn handle_ws_message(
                     g.playing_audio = true;
                 }
                 pb.push_pcm(&pcm, in_sr);
+                // Accumulate assistant audio for possible STT
+                {
+                    let mut g = inner.write();
+                    g.assistant_pcm.extend_from_slice(&pcm);
+                }
             }
         }
         Some(Ok(Message::Close(c))) => { rt_log(format!("<- CLOSE: {:?}", c)); let _ = ws.close(None).await; let mut g = inner.write(); g.status.active = false; }
@@ -276,6 +308,8 @@ struct InnerState {
     // Accumulators for chat logging
     user_text_buf: String,
     assistant_text_buf: String,
+    // Accumulate assistant PCM for fallback STT of agent replies
+    assistant_pcm: Vec<i16>,
     // Recent mic audio ring buffer for local STT
     ring: VecDeque<i16>,
 }
@@ -292,7 +326,7 @@ pub struct RealtimeManager {
 impl Default for RealtimeManager {
     fn default() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), ring: VecDeque::with_capacity(16000*8) })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), ring: VecDeque::with_capacity(16000*8) })),
             tools: crate::tools::ToolsManager::default(),
             policy: Arc::new(crate::gatekeeper::PolicyEngine::default()),
             approval_prompt: Arc::new(RwLock::new(None)),
@@ -304,7 +338,7 @@ impl Default for RealtimeManager {
 impl RealtimeManager {
     pub fn new(tools: crate::tools::ToolsManager, policy: Arc<crate::gatekeeper::PolicyEngine>, approval_prompt: Arc<RwLock<Option<crate::app::EphemeralApproval>>>, chat_dir: Option<PathBuf>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), ring: VecDeque::with_capacity(16000*8) })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), ring: VecDeque::with_capacity(16000*8) })),
             tools,
             policy,
             approval_prompt,
