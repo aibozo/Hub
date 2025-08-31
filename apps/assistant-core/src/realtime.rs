@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use futures_util::{SinkExt, StreamExt};
 use std::path::PathBuf;
+use uuid::Uuid;
 #[cfg(feature = "realtime")]
 use tokio::net::TcpStream;
 #[cfg(feature = "realtime")]
@@ -75,6 +76,25 @@ async fn handle_ws_message(
                     }
                     return;
                 }
+                // Accumulate assistant text deltas; flush on response.done
+                if typ.ends_with("output_text.delta") || typ == "response.output_text.delta" || typ == "response.text.delta" {
+                    if let Some(delta) = v.get("delta").and_then(|s| s.as_str()).or_else(|| v.get("text").and_then(|s| s.as_str())) {
+                        let mut g = inner.write();
+                        g.assistant_text_buf.push_str(delta);
+                    }
+                    return;
+                }
+                if typ.ends_with("output_text.done") || typ.ends_with("response.done") || typ == "response.completed" {
+                    // Flush assistant text buffer to chat
+                    let text = {
+                        let mut g = inner.write();
+                        if g.assistant_text_buf.is_empty() { None } else { Some(std::mem::take(&mut g.assistant_text_buf)) }
+                    };
+                    if let (Some(dir), Some(line)) = (chat_dir.as_ref(), text) {
+                        let _ = append_latest_chat_message(dir, "assistant", &line).await;
+                    }
+                    // Also mark end of speaking handled below for audio; continue
+                }
                 // Toggle playing state based on lifecycle events
                 if typ.ends_with("response.audio.done") || typ.ends_with("response.done") {
                     let mut g = inner.write();
@@ -90,6 +110,24 @@ async fn handle_ws_message(
                 }
                 if typ == "input_audio_buffer.speech_started" || typ.ends_with("speech_started") {
                     rt_log("<- speech_started");
+                }
+                // Server-side user transcription (preferred): accumulate and flush
+                if (typ.contains("input_audio_buffer") && typ.contains("transcription") && typ.ends_with("delta")) || typ == "input_audio_buffer.transcription.delta" {
+                    if let Some(delta) = v.get("delta").and_then(|s| s.as_str()).or_else(|| v.get("text").and_then(|s| s.as_str())).or_else(|| v.get("transcript").and_then(|s| s.as_str())) {
+                        let mut g = inner.write();
+                        g.user_text_buf.push_str(delta);
+                    }
+                    return;
+                }
+                if (typ.contains("input_audio_buffer") && typ.contains("transcription") && (typ.ends_with("completed") || typ.ends_with("done"))) || typ == "input_audio_buffer.transcription.completed" {
+                    let text = {
+                        let mut g = inner.write();
+                        if g.user_text_buf.is_empty() { None } else { Some(std::mem::take(&mut g.user_text_buf)) }
+                    };
+                    if let (Some(dir), Some(line)) = (chat_dir.as_ref(), text) {
+                        let _ = append_latest_chat_message(dir, "user", &line).await;
+                    }
+                    return;
                 }
                 if typ == "error" || typ.ends_with("error") {
                     // Try to extract nested error.message or log raw JSON
@@ -216,6 +254,9 @@ struct InnerState {
     stop_tx: Option<oneshot::Sender<()>>,
     session_log: Option<SessionLog>,
     playing_audio: bool,
+    // Accumulators for chat logging
+    user_text_buf: String,
+    assistant_text_buf: String,
 }
 
 #[derive(Clone)]
@@ -230,7 +271,7 @@ pub struct RealtimeManager {
 impl Default for RealtimeManager {
     fn default() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new() })),
             tools: crate::tools::ToolsManager::default(),
             policy: Arc::new(crate::gatekeeper::PolicyEngine::default()),
             approval_prompt: Arc::new(RwLock::new(None)),
@@ -242,7 +283,7 @@ impl Default for RealtimeManager {
 impl RealtimeManager {
     pub fn new(tools: crate::tools::ToolsManager, policy: Arc<crate::gatekeeper::PolicyEngine>, approval_prompt: Arc<RwLock<Option<crate::app::EphemeralApproval>>>, chat_dir: Option<PathBuf>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new() })),
             tools,
             policy,
             approval_prompt,
@@ -359,19 +400,20 @@ impl RealtimeManager {
                 let _cap_keepalive = match crate::realtime_audio::start_capture(cap_sr, 40, tx_frames) { Ok(c) => Some(c), Err(e) => { eprintln!("[realtime] audio capture init error: {}", e); None } };
 
                 // Build session.update per OpenAI docs: set voice, modalities, audio formats, server VAD
-                let payload = serde_json::json!({
-                    "type": "session.update",
-                    "session": {
-                        "model": model,
-                        "instructions": instructions,
-                        "voice": voice,
-                        "modalities": ["audio","text"],
-                        "input_audio_format": "pcm16",
-                        "output_audio_format": out_fmt,
-                        "turn_detection": { "type": "server_vad" },
-                        "tools": crate::tools::realtime_tool_schemas(&tools)
-                    }
-                });
+            let payload = serde_json::json!({
+                "type": "session.update",
+                "session": {
+                    "model": model,
+                    "instructions": instructions,
+                    "voice": voice,
+                    "modalities": ["audio","text"],
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": out_fmt,
+                    "turn_detection": { "type": "server_vad" },
+                    "input_audio_transcription": { "enabled": true, "model": std::env::var("REALTIME_TRANSCRIBE_MODEL").unwrap_or_else(|_| "gpt-4o-mini-transcribe".into()) },
+                    "tools": crate::tools::realtime_tool_schemas(&tools)
+                }
+            });
 
                 use tokio_tungstenite::tungstenite::Message;
                 let upd_txt = payload.to_string();
@@ -615,6 +657,35 @@ async fn append_voice_summary(dir: &PathBuf, line: &str) -> anyhow::Result<()> {
     let mut v: serde_json::Value = match tokio::fs::read(&path).await.ok().and_then(|b| serde_json::from_slice(&b).ok()) { Some(j) => j, None => serde_json::json!({"id":"","messages": []}) };
     let at = chrono::Utc::now().to_rfc3339();
     let msg = serde_json::json!({"role":"assistant","content": line, "at": at});
+    v.as_object_mut().and_then(|o| o.get_mut("messages")).and_then(|m| m.as_array_mut()).map(|arr| arr.push(msg));
+    let data = serde_json::to_vec_pretty(&v)?;
+    tokio::fs::write(&path, data).await?;
+    Ok(())
+}
+
+async fn append_latest_chat_message(dir: &PathBuf, role: &str, content: &str) -> anyhow::Result<()> {
+    // Find latest chat, or create one if none exist
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            if e.file_type().await.ok().map(|t| t.is_file()).unwrap_or(false) {
+                if e.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(meta) = e.metadata().await { if let Ok(mtime) = meta.modified() { if best.as_ref().map(|(t,_)| mtime > *t).unwrap_or(true) { best = Some((mtime, e.path())); } } }
+                }
+            }
+        }
+    }
+    let path = match best { Some((_, p)) => p, None => {
+        let id = Uuid::new_v4().to_string();
+        let p = dir.join(format!("{}.json", id));
+        let obj = serde_json::json!({"id": id, "messages": []});
+        if let Some(parent) = p.parent() { tokio::fs::create_dir_all(parent).await.ok(); }
+        let _ = tokio::fs::write(&p, serde_json::to_vec_pretty(&obj)?).await;
+        p
+    } };
+    let mut v: serde_json::Value = match tokio::fs::read(&path).await.ok().and_then(|b| serde_json::from_slice(&b).ok()) { Some(j) => j, None => serde_json::json!({"id":"","messages": []}) };
+    let at = chrono::Utc::now().to_rfc3339();
+    let msg = serde_json::json!({"role": role, "content": content, "at": at});
     v.as_object_mut().and_then(|o| o.get_mut("messages")).and_then(|m| m.as_array_mut()).map(|arr| arr.push(msg));
     let data = serde_json::to_vec_pretty(&v)?;
     tokio::fs::write(&path, data).await?;
