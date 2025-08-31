@@ -58,9 +58,9 @@ else
   LOG_FILE="storage/logs/assistant-core-${TS}.log"
   log "Starting assistant-core at $FOREMAN_BIND (logs: $LOG_FILE)"
   # Run in background; inherit environment. Optional features via CORE_FEATURES env (comma-separated)
-  CORE_FEATURES_ARG=()
-  if [ -n "${CORE_FEATURES:-}" ]; then CORE_FEATURES_ARG+=(--features "$CORE_FEATURES"); fi
-  ( RUST_LOG=${RUST_LOG:-info} FOREMAN_BIND="$FOREMAN_BIND" cargo run -p assistant-core --bin assistant-core ${CORE_FEATURES_ARG[@]} ) \
+  # Enable realtime + audio features by default; override via CORE_FEATURES
+  CORE_FEATURES_VAL="${CORE_FEATURES:-realtime,realtime-audio}"
+  ( RUST_LOG=${RUST_LOG:-info} FOREMAN_BIND="$FOREMAN_BIND" cargo run -p assistant-core --bin assistant-core --features "$CORE_FEATURES_VAL" ) \
     >>"$LOG_FILE" 2>&1 &
   CORE_PID=$!
   OWNED_CORE=1

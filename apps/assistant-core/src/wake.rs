@@ -9,6 +9,16 @@ use tokio::sync::mpsc;
 #[cfg(feature = "realtime-audio")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+fn wake_log(line: impl AsRef<str>) {
+    let line = line.as_ref();
+    let _ = std::fs::create_dir_all("storage/logs");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("storage/logs/wake.log") {
+        use std::io::Write as _;
+        let ts = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) { Ok(d) => d.as_millis(), Err(_) => 0 };
+        let _ = writeln!(f, "[{}] {}", ts, line);
+    }
+}
+
 #[derive(Clone)]
 pub struct WakeOptions {
     pub phrase: String,
@@ -56,7 +66,8 @@ impl WakeSentinel {
         drop(g);
 
         tokio::spawn(async move {
-            if !opts.enabled { return; }
+            if !opts.enabled { wake_log("wake: disabled at start; not listening"); return; }
+            wake_log(format!("wake: starting (enabled=true, sr=16000, chunk=30ms, phrase=\"{}\")", opts.phrase));
             // Start capture in a dedicated thread to avoid Send bounds; deliver frames via tokio mpsc
             let (tx_frames, mut rx_frames) = mpsc::channel::<Vec<i16>>(16);
             let stop_flag = Arc::new(AtomicBool::new(false));
@@ -93,8 +104,11 @@ impl WakeSentinel {
                                 in_speech = false;
                                 if speech_len_ms >= opts.min_speech_ms {
                                     // Transcribe and match wake phrase
+                                    wake_log(format!("wake: speech ended ({} ms) — transcribing", speech_len_ms));
                                     let text = transcribe(&phrase_buf, 16000).await;
+                                    if !text.is_empty() { wake_log(format!("wake: transcript=\"{}\"", text)); }
                                     if matches_wake(&text, &opts.phrase) && last_trigger.elapsed().as_millis() as u64 >= opts.refractory_ms {
+                                        wake_log("wake: phrase matched — starting realtime session");
                                         let _ = realtime.start(crate::realtime::RealtimeOptions { model: Some("gpt-realtime".into()), voice: Some("alloy".into()), audio: Some(crate::realtime::RealtimeAudioOpts { in_sr: Some(16000), out_format: Some("pcm16".into()) }), instructions: None, endpoint: None, transport: None }).await;
                                         last_trigger = std::time::Instant::now();
                                     }
