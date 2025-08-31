@@ -338,7 +338,8 @@ impl RealtimeManager {
                 if rt.is_err() { return; }
                 let rt = rt.unwrap();
                 rt.block_on(async move {
-                let mut instructions = base_instructions;
+                let mut instructions = if base_instructions.is_empty() { crate::prompt::base_system_prompt() } else { base_instructions };
+                instructions.push_str(&crate::prompt::voice_mode_suffix());
                 // Seed with recent chat turns (compact digest)
                 if let Some(dir) = chat_dir.as_ref() {
                     if let Some(ctx) = build_recent_context(dir).await { instructions.push_str("\n\nRecent context:\n"); instructions.push_str(&ctx); }

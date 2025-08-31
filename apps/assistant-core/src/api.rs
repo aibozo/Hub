@@ -697,51 +697,7 @@ fn load_steamgames_user_list() -> Vec<(String, String)> {
     out
 }
 
-fn system_prompt() -> String {
-    // Pinned local instructions for emulators and ROMs + dynamic game list
-    let roms_root = "/home/kil/games/roms";
-    let ds_emulator = "/home/kil/games/emulators/melonDS-x86_64.AppImage";
-    let gb_cmd = "mgba-qt";
-    let mut s = String::new();
-    s.push_str("Local Context:\n");
-    s.push_str(&format!("- Game ROMs folder: {}\n", roms_root));
-    s.push_str("- Emulators:\n");
-    s.push_str(&format!("  • Nintendo DS: {} (launch without arguments)\n", ds_emulator));
-    s.push_str(&format!("  • Game Boy / Game Boy Advance: {} (usage: mgba-qt /path/to/game)\n", gb_cmd));
-
-    // Dynamic games list by console (subdirectories under ROMs)
-    let games = scan_roms_root(roms_root);
-    if !games.is_empty() {
-        s.push_str("\nAvailable games by console:\n");
-        for (console, titles) in games {
-            s.push_str(&format!("- {}: ", console));
-            let joined = titles.join(", ");
-            s.push_str(&joined);
-            s.push('\n');
-        }
-    }
-
-    // Steam quick-launch mapping from config/steamgames.toml
-    let steam_games = load_steamgames_user_list();
-    if !steam_games.is_empty() {
-        s.push_str("\nSteam Games: appid\n");
-        for (name, appid) in steam_games {
-            s.push_str(&format!("- {}: {}\n", name, appid));
-        }
-        s.push_str("\nLaunch policy:\n");
-        s.push_str("- Prefer the steam.launch tool with the AppID.\n");
-        s.push_str("- Or use shell.exec: steam -applaunch <APPID> (allowed).\n");
-    }
-
-    s.push_str("\nTool usage policy:\n");
-    s.push_str("- When launching emulators:\n");
-    s.push_str(&format!("  • DS: run the emulator by itself: {} (no ROM path).\n", ds_emulator));
-    s.push_str(&format!("  • Game Boy: launch with the ROM file: {} /path/to/game.\n", gb_cmd));
-    s.push_str(&format!("  • For Game Boy, list files in {} first to find the exact ROM path requested.\n", roms_root));
-    s.push_str("  • If a game title appears under exactly one console above, you can infer the console. If ambiguous, ask.\n");
-    s.push_str("  • Do not attempt other shell commands. Only the above patterns are allowed.\n");
-    s
-}
+fn system_prompt() -> String { crate::prompt::base_system_prompt() }
 
 fn scan_roms_root(root: &str) -> Vec<(String, Vec<String>)> {
     use std::fs;
