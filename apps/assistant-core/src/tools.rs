@@ -216,7 +216,8 @@ pub fn realtime_tool_schemas(tm: &ToolsManager) -> Vec<serde_json::Value> {
     let mut out = vec![];
     for (server, tools) in tm.list().into_iter() {
         for t in tools {
-            let name = format!("{}.{}", server, t).replace('-', "_");
+            // Tool names must match ^[a-zA-Z0-9_-]+$ in Realtime; use underscores
+            let name = format!("{}_{}", server, t).replace('-', "_");
             let (desc, params): (String, serde_json::Value) = if server == "shell" && t == "exec" {
                 (
                     "Execute a desktop command with strict policy. Usage: {\"cmd\":\"mgba-qt\",\"args\":[\"/home/kil/games/roms/<console>/<file>\"]} (GB/GBA). For Nintendo DS: {\"cmd\":\"/home/kil/games/emulators/melonDS-x86_64.AppImage\",\"args\":[]}. Optional: {\"wait\": false} to spawn and return a PID.".to_string(),
