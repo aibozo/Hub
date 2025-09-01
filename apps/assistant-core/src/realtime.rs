@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashSet};
 use futures_util::{SinkExt, StreamExt};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -98,42 +98,65 @@ async fn handle_ws_message(
                     }
                     return;
                 }
-                if typ.ends_with("output_text.done") || typ.ends_with("text.done") || typ.ends_with("audio_transcript.done") || typ.ends_with("response.done") || typ == "response.completed" {
-                    // Flush assistant text buffer to chat
-                    let text = {
+                if typ.ends_with("output_text.done") || typ.ends_with("text.done") || typ.ends_with("audio_transcript.done") || typ == "response.completed" {
+                    // Flush assistant text buffer to chat (only if not already flushed)
+                    let (should_append, text_opt) = {
                         let mut g = inner.write();
-                        if g.assistant_text_buf.is_empty() { None } else { Some(std::mem::take(&mut g.assistant_text_buf)) }
+                        let should = !g.assistant_flushed && !g.assistant_text_buf.is_empty();
+                        let txt = if should { Some(std::mem::take(&mut g.assistant_text_buf)) } else { None };
+                        (should, txt)
                     };
-                    if let (Some(dir), Some(line)) = (chat_dir.as_ref(), text) {
-                        let _ = append_latest_chat_message(dir, "assistant", &line).await;
+                    if should_append {
+                        if let (Some(dir), Some(line)) = (chat_dir.as_ref(), text_opt) {
+                            let _ = append_latest_chat_message(dir, "assistant", &line).await;
+                            let mut g = inner.write();
+                            g.assistant_flushed = true;
+                        }
                     }
-                    // Also mark end of speaking handled below for audio; continue
+                    // Continue to lifecycle handling below
                 }
                 // Toggle playing state based on lifecycle events
-                if typ.ends_with("response.audio.done") || typ.ends_with("response.done") {
+                if typ.ends_with("response.audio.done") {
                     let mut g = inner.write();
                     if g.playing_audio { rt_log("[state] assistant done speaking"); }
                     g.playing_audio = false;
-                    // If no text was flushed, attempt STT on assistant audio for chat logging
-                    let have_text = !g.assistant_text_buf.is_empty();
-                    let pcm: Vec<i16> = if have_text { vec![] } else { std::mem::take(&mut g.assistant_pcm) };
-                    drop(g);
-                    if !have_text && !pcm.is_empty() {
-                        if let Some(dir) = chat_dir.as_ref() {
-                            let dir = dir.clone();
-                            tokio::spawn(async move {
-                                let t = transcribe_user_local(&pcm, in_sr).await; // reuse same STT
-                                if !t.is_empty() { let _ = append_latest_chat_message(&dir, "assistant", &t).await; }
-                            });
+                    g.response_active = false;
+                    // If not yet flushed, attempt STT on assistant audio for chat logging
+                    if !g.assistant_flushed {
+                        let pcm: Vec<i16> = std::mem::take(&mut g.assistant_pcm);
+                        // Mark flushed now to avoid duplicate on multiple done events
+                        g.assistant_flushed = true;
+                        drop(g);
+                        if !pcm.is_empty() {
+                            if let Some(dir) = chat_dir.as_ref() {
+                                let dir = dir.clone();
+                                tokio::spawn(async move {
+                                    let t = transcribe_user_local(&pcm, in_sr).await; // reuse same STT
+                                    if !t.is_empty() { let _ = append_latest_chat_message(&dir, "assistant", &t).await; }
+                                });
+                            }
                         }
+                    } else {
+                        drop(g);
                     }
                     return;
                 }
-                if typ.ends_with("response.created") || typ.ends_with("response.output_item.added") {
+                if typ == "response.done" {
+                    // Ensure response_active cleared for text-only responses
+                    let mut g = inner.write();
+                    g.response_active = false;
+                    // playing_audio may already be false; leave as is
+                    // Do not append here; text/audio handlers already flushed content
+                    return;
+                }
+                if typ.ends_with("response.created") {
                     let mut g = inner.write();
                     if !g.playing_audio { rt_log("[state] response started"); }
                     g.playing_audio = true;
                     g.assistant_pcm.clear();
+                    g.assistant_text_buf.clear();
+                    g.assistant_flushed = false;
+                    g.response_active = true;
                     // fall through to normal processing/logging
                 }
                 if typ == "input_audio_buffer.speech_started" || typ.ends_with("speech_started") {
@@ -158,6 +181,77 @@ async fn handle_ws_message(
                     }
                     return;
                 }
+                // Function calling: process function_call items on response.done
+                if typ == "response.done" {
+                    let mut handled = false;
+                    let mut call_events: Vec<(String, bool, Option<String>)> = vec![]; // (name, ok, err)
+                    if let Some(resp) = v.get("response") {
+                        if let Some(items) = resp.get("output").and_then(|o| o.as_array()) {
+                            for it in items {
+                                if it.get("type").and_then(|s| s.as_str()) == Some("function_call") {
+                                    let name = it.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                    let call_id = it.get("call_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                    let args_str = it.get("arguments").and_then(|s| s.as_str()).unwrap_or("{}");
+                                    // Skip if already processed via args.done
+                                    let mut skip = false;
+                                    {
+                                        let mut g = inner.write();
+                                        if g.processed_calls.contains(&call_id) { skip = true; } else { g.processed_calls.insert(call_id.clone()); }
+                                    }
+                                    let args_json: serde_json::Value = serde_json::from_str(args_str).unwrap_or_else(|_| serde_json::json!({}));
+                                    rt_log(format!("function_call(done): name={} call_id={} args={}", name, call_id, truncate(args_str, 200)));
+                                    // Invoke via ToolsManager with policy/approvals
+                                    let result = handle_tool_call(tools, policy, approval_prompt, &name, args_json).await;
+                                    // Log to session
+                                    {
+                                        let ok = result.get("error").is_none();
+                                        let err = result.get("error").and_then(|e| e.as_str()).map(|s| truncate(s, 120));
+                                        let mut g = inner.write();
+                                        if let Some(log) = g.session_log.as_mut() { log.tool_calls.push(SessionToolEvent { name: name.clone(), ok, error: err.clone() }); }
+                                        call_events.push((name.clone(), ok, err));
+                                    }
+                                    // Send function_call_output conversation item
+                                    let output_str = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
+                                    let item = serde_json::json!({
+                                        "type": "conversation.item.create",
+                                        "item": {"type": "function_call_output", "call_id": call_id, "output": output_str}
+                                    });
+                                    let _ = ws.send(Message::Text(item.to_string())).await;
+                                    handled = true;
+                                }
+                            }
+                        }
+                    }
+                    if handled {
+                        // Optionally append a compact tool summary into chat
+                        let append_summary = match std::env::var("REALTIME_APPEND_TOOL_SUMMARY") { Ok(v) => matches!(v.as_str(), "1"|"true"|"True"|"TRUE"), Err(_) => false };
+                        if append_summary && !call_events.is_empty() {
+                            let mut parts: Vec<String> = vec![];
+                            for (name, ok, err) in call_events.iter().take(4) {
+                                if *ok { parts.push(format!("{} ok", name)); }
+                                else { parts.push(format!("{} err: {}", name, err.clone().unwrap_or_else(|| "(error)".into()))); }
+                            }
+                            if call_events.len() > 4 { parts.push(format!("… {} more", call_events.len() - 4)); }
+                            let line = if call_events.len() == 1 { format!("Tool: {}", parts.join(", ")) } else { format!("Tools: {}", parts.join(", ")) };
+                            if let Some(dir) = chat_dir.as_ref() { let _ = append_latest_chat_message(dir, "assistant", &line).await; }
+                        }
+                        // Ask model to continue with the provided function outputs (guard against concurrent)
+                        let mut allow = false;
+                        {
+                            let mut g = inner.write();
+                            if !g.response_active { g.response_active = true; allow = true; }
+                        }
+                        if allow {
+                            rt_log("-> response.create (post function_call_output)");
+                            let create = serde_json::json!({"type":"response.create","response": {"modalities":["audio","text"]}});
+                            let _ = ws.send(Message::Text(create.to_string())).await;
+                        } else {
+                            rt_log("skip response.create (response_active)");
+                        }
+                        return;
+                    }
+                    // fall through when no function_call outputs were present
+                }
                 if typ == "error" || typ.ends_with("error") {
                     // Try to extract nested error.message or log raw JSON
                     let msg = v.get("error")
@@ -172,9 +266,21 @@ async fn handle_ws_message(
                 }
                 if typ == "input_audio_buffer.speech_stopped" || typ.ends_with("speech_stopped") {
                     // Server VAD signaled end of user turn; request a response
-                    rt_log("<- speech_stopped; -> response.create [audio,text]");
-                    let create = serde_json::json!({"type":"response.create","response": {"modalities":["audio","text"]}});
-                    let _ = ws.send(Message::Text(create.to_string())).await;
+                    let mut allow_create = false;
+                    {
+                        let mut g = inner.write();
+                        if !g.response_active {
+                            g.response_active = true; // mark inflight to avoid duplicate create
+                            allow_create = true;
+                        }
+                    }
+                    if allow_create {
+                        rt_log("<- speech_stopped; -> response.create [audio,text] (new)");
+                        let create = serde_json::json!({"type":"response.create","response": {"modalities":["audio","text"]}});
+                        let _ = ws.send(Message::Text(create.to_string())).await;
+                    } else {
+                        rt_log("<- speech_stopped; response already active (skip create)");
+                    }
                     // Also produce a local transcript for chat logging (best-effort)
                     if let Some(dir) = chat_dir.as_ref() {
                         let samples: Vec<i16> = {
@@ -310,6 +416,12 @@ struct InnerState {
     assistant_text_buf: String,
     // Accumulate assistant PCM for fallback STT of agent replies
     assistant_pcm: Vec<i16>,
+    // Whether we've already appended the assistant's current turn to chat
+    assistant_flushed: bool,
+    // True while a model response is in progress or just requested
+    response_active: bool,
+    // De-dup executed function calls by call_id within a session
+    processed_calls: HashSet<String>,
     // Recent mic audio ring buffer for local STT
     ring: VecDeque<i16>,
 }
@@ -326,7 +438,7 @@ pub struct RealtimeManager {
 impl Default for RealtimeManager {
     fn default() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), ring: VecDeque::with_capacity(16000*8) })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), assistant_flushed: false, response_active: false, processed_calls: HashSet::new(), ring: VecDeque::with_capacity(16000*8) })),
             tools: crate::tools::ToolsManager::default(),
             policy: Arc::new(crate::gatekeeper::PolicyEngine::default()),
             approval_prompt: Arc::new(RwLock::new(None)),
@@ -338,7 +450,7 @@ impl Default for RealtimeManager {
 impl RealtimeManager {
     pub fn new(tools: crate::tools::ToolsManager, policy: Arc<crate::gatekeeper::PolicyEngine>, approval_prompt: Arc<RwLock<Option<crate::app::EphemeralApproval>>>, chat_dir: Option<PathBuf>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), ring: VecDeque::with_capacity(16000*8) })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), assistant_flushed: false, response_active: false, processed_calls: HashSet::new(), ring: VecDeque::with_capacity(16000*8) })),
             tools,
             policy,
             approval_prompt,
@@ -466,6 +578,7 @@ impl RealtimeManager {
                         "input_audio_format": "pcm16",
                         "output_audio_format": out_fmt,
                         "turn_detection": { "type": "server_vad" },
+                        "tool_choice": "auto",
                         "tools": crate::tools::realtime_tool_schemas(&tools)
                     }
                 });
@@ -758,6 +871,20 @@ async fn append_latest_chat_message(dir: &PathBuf, role: &str, content: &str) ->
         p
     } };
     let mut v: serde_json::Value = match tokio::fs::read(&path).await.ok().and_then(|b| serde_json::from_slice(&b).ok()) { Some(j) => j, None => serde_json::json!({"id":"","messages": []}) };
+    // Deduplicate: if the last message matches role+content, skip append
+    let is_dup = {
+        let last = v.get("messages").and_then(|m| m.as_array()).and_then(|arr| arr.last());
+        match last {
+            Some(m) => {
+                let same_role = m.get("role").and_then(|s| s.as_str()) == Some(role);
+                let last_content = m.get("content").and_then(|s| s.as_str()).unwrap_or("").trim();
+                let new_content = content.trim();
+                same_role && last_content == new_content
+            }
+            None => false,
+        }
+    };
+    if is_dup { return Ok(()); }
     let at = chrono::Utc::now().to_rfc3339();
     let msg = serde_json::json!({"role": role, "content": content, "at": at});
     v.as_object_mut().and_then(|o| o.get_mut("messages")).and_then(|m| m.as_array_mut()).map(|arr| arr.push(msg));

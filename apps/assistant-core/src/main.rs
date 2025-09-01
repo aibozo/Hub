@@ -13,6 +13,7 @@ mod realtime;
 mod realtime_audio;
 mod wake;
 mod stt;
+mod prompt;
 
 use anyhow::Context;
 use axum::Router;

@@ -680,7 +680,7 @@ async fn chat_complete(State(state): State<SharedState>, Json(req): Json<ChatReq
     (StatusCode::BAD_GATEWAY, Json(ApiError { message: "tool loop exceeded".into() })).into_response()
 }
 
-fn load_steamgames_user_list() -> Vec<(String, String)> {
+pub(crate) fn load_steamgames_user_list() -> Vec<(String, String)> {
     let path = std::path::Path::new("config/steamgames.toml");
     if !path.exists() { return vec![]; }
     let Ok(text) = std::fs::read_to_string(path) else { return vec![] };
