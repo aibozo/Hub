@@ -1,3 +1,4 @@
+extern crate self as assistant_core;
 pub mod api;
 pub mod app;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod realtime;
 pub mod realtime_audio;
 pub mod wake;
 pub mod prompt;
+pub mod research;
 #[cfg(feature = "wake-porcupine")]
 pub mod wake_porcupine;
 pub mod stt;

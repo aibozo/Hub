@@ -59,8 +59,8 @@ This matrix specifies, for each subsystem, where it is implemented and where it 
   - Wires to: Research servers (PR-0010), Artifacts + Memory (PR-0004), TUI Tasks or Briefs view (PR-0008 update)
 
 - Research (arXiv/News)
-  - Implemented: PR-0010
-  - Wires to: Scheduler jobs (PR-0009), Tools registry (PR-0006 update)
+  - Implemented: PR-0010, PR-0101..0108
+  - Wires to: Tools registry (Rust `mcp-arxiv` stdio; PR-0103), Research framework/packer (PR-0104), Scheduler arxiv brief (PR-0105), TUI Research screen (PR-0106), Multiagent scaffold (PR-0107), Final integration/tests (PR-0108)
 
 - Installer Server
   - Implemented: PR-0011

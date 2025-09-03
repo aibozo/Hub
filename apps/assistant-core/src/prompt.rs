@@ -48,6 +48,14 @@ pub fn base_system_prompt() -> String {
     s.push_str("\nSafety & Policy:\n");
     s.push_str("- Risky actions require approval; propose the action and wait.\n");
     s.push_str("- Use available tools via the provided schemas; avoid guessing paths.\n");
+
+    // Research tools (arXiv)
+    s.push_str("\nResearch (arXiv) tools:\n");
+    s.push_str("- Use arxiv.search with JSON params: {query, categories?, from?, max_results?}.\n");
+    s.push_str("  Example: {\"query\":\"mixture-of-experts\",\"categories\":[\"cs.LG\"],\"from\":\"2025-09-01T00:00:00Z\",\"max_results\":25}.\n");
+    s.push_str("- Use arxiv.top for month snapshots: {month:\"YYYY-MM\", n}. Example: {\"month\":\"2025-09\",\"n\":5}.\n");
+    s.push_str("- Use arxiv.fetch_pdf to download: {id:\"YYMM.NNNNN\"}. Example: {\"id\":\"2509.01234\"}.\n");
+    s.push_str("- arxiv.summarize is not implemented yet; avoid calling it.\n");
     s
 }
 

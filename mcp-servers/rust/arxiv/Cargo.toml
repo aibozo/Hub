@@ -1,0 +1,31 @@
+[package]
+name = "mcp-arxiv"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "io-std", "fs", "time"] }
+chrono = { version = "0.4", features = ["clock"] }
+foreman-mcp = { path = "../../../crates/foreman-mcp" }
+
+[dependencies.reqwest]
+version = "0.12"
+default-features = false
+features = ["rustls-tls", "http2"]
+
+[dependencies.quick-xml]
+version = "0.31"
+
+[dependencies.urlencoding]
+version = "2.1"
+
+[lib]
+name = "mcp_arxiv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mcp-arxiv"
+path = "src/main.rs"

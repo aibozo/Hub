@@ -142,12 +142,10 @@ async fn handle_ws_message(
                     return;
                 }
                 if typ == "response.done" {
-                    // Ensure response_active cleared for text-only responses
+                    // Ensure response_active cleared (may be set again if we resume after function outputs)
                     let mut g = inner.write();
                     g.response_active = false;
-                    // playing_audio may already be false; leave as is
-                    // Do not append here; text/audio handlers already flushed content
-                    return;
+                    // Continue; function-calling handler below will inspect response.output
                 }
                 if typ.ends_with("response.created") {
                     let mut g = inner.write();
@@ -210,13 +208,31 @@ async fn handle_ws_message(
                                         if let Some(log) = g.session_log.as_mut() { log.tool_calls.push(SessionToolEvent { name: name.clone(), ok, error: err.clone() }); }
                                         call_events.push((name.clone(), ok, err));
                                     }
-                                    // Send function_call_output conversation item
+                                    // Send function_call_output conversation item (with event_id)
                                     let output_str = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
+                                    rt_log(format!("function_result: name={} ok={} len={} body={}", name, result.get("error").is_none(), output_str.len(), truncate(&output_str, 300)));
+                                    let eid = Uuid::new_v4().to_string();
+                                    {
+                                        let mut g = inner.write();
+                                        g.event_tags.insert(eid.clone(), format!("function_call_output {}", call_id));
+                                    }
                                     let item = serde_json::json!({
+                                        "event_id": eid,
                                         "type": "conversation.item.create",
                                         "item": {"type": "function_call_output", "call_id": call_id, "output": output_str}
                                     });
                                     let _ = ws.send(Message::Text(item.to_string())).await;
+                                    // If end_call, close session now (no further response)
+                                    if name == "end_call" || name == "end.call" {
+                                        rt_log("end_call: closing websocket and ending session (response.done)");
+                                        {
+                                            let mut g = inner.write();
+                                            g.status.active = false;
+                                            g.response_active = false;
+                                        }
+                                        let _ = ws.close(None).await;
+                                        return;
+                                    }
                                     handled = true;
                                 }
                             }
@@ -242,8 +258,13 @@ async fn handle_ws_message(
                             if !g.response_active { g.response_active = true; allow = true; }
                         }
                         if allow {
+                            let eid = Uuid::new_v4().to_string();
+                            {
+                                let mut g = inner.write();
+                                g.event_tags.insert(eid.clone(), "response.create post function_call_output".into());
+                            }
                             rt_log("-> response.create (post function_call_output)");
-                            let create = serde_json::json!({"type":"response.create","response": {"modalities":["audio","text"]}});
+                            let create = serde_json::json!({"event_id": eid, "type":"response.create","response": {"modalities":["audio","text"]}});
                             let _ = ws.send(Message::Text(create.to_string())).await;
                         } else {
                             rt_log("skip response.create (response_active)");
@@ -252,14 +273,21 @@ async fn handle_ws_message(
                     }
                     // fall through when no function_call outputs were present
                 }
-                if typ == "error" || typ.ends_with("error") {
+                if typ == "error" || typ.ends_with("error") || typ.ends_with("invalid_request_error") {
                     // Try to extract nested error.message or log raw JSON
                     let msg = v.get("error")
                         .and_then(|e| e.get("message").and_then(|m| m.as_str()))
                         .or_else(|| v.get("message").and_then(|m| m.as_str()))
                         .unwrap_or("");
-                    if !msg.is_empty() { rt_log(format!("<- error: {}", msg)); }
-                    else { rt_log(format!("<- error raw: {}", txt)); }
+                    let eid = v.get("event_id").and_then(|s| s.as_str()).unwrap_or("");
+                    let tag = if !eid.is_empty() { let mut g = inner.write(); g.event_tags.remove(eid) } else { None };
+                    if !msg.is_empty() {
+                        if let Some(t) = tag { rt_log(format!("<- error: {} (event_id={} tag={})", msg, eid, t)); }
+                        else { rt_log(format!("<- error: {} (event_id={})", msg, eid)); }
+                    } else {
+                        if let Some(t) = tag { rt_log(format!("<- error raw (event_id={} tag={}): {}", eid, t, txt)); }
+                        else { rt_log(format!("<- error raw (event_id={}): {}", eid, txt)); }
+                    }
                     let mut g = inner.write();
                     g.status.last_error = Some(if !msg.is_empty() { format!("realtime error: {}", msg) } else { "realtime error".into() });
                     return;
@@ -422,6 +450,8 @@ struct InnerState {
     response_active: bool,
     // De-dup executed function calls by call_id within a session
     processed_calls: HashSet<String>,
+    // Map client event_id -> tag for error correlation
+    event_tags: std::collections::HashMap<String, String>,
     // Recent mic audio ring buffer for local STT
     ring: VecDeque<i16>,
 }
@@ -438,7 +468,7 @@ pub struct RealtimeManager {
 impl Default for RealtimeManager {
     fn default() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), assistant_flushed: false, response_active: false, processed_calls: HashSet::new(), ring: VecDeque::with_capacity(16000*8) })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), assistant_flushed: false, response_active: false, processed_calls: HashSet::new(), event_tags: std::collections::HashMap::new(), ring: VecDeque::with_capacity(16000*8) })),
             tools: crate::tools::ToolsManager::default(),
             policy: Arc::new(crate::gatekeeper::PolicyEngine::default()),
             approval_prompt: Arc::new(RwLock::new(None)),
@@ -450,7 +480,7 @@ impl Default for RealtimeManager {
 impl RealtimeManager {
     pub fn new(tools: crate::tools::ToolsManager, policy: Arc<crate::gatekeeper::PolicyEngine>, approval_prompt: Arc<RwLock<Option<crate::app::EphemeralApproval>>>, chat_dir: Option<PathBuf>) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), assistant_flushed: false, response_active: false, processed_calls: HashSet::new(), ring: VecDeque::with_capacity(16000*8) })),
+            inner: Arc::new(RwLock::new(InnerState { status: RealtimeStatus::default(), handle: None, stop_tx: None, session_log: None, playing_audio: false, user_text_buf: String::new(), assistant_text_buf: String::new(), assistant_pcm: Vec::new(), assistant_flushed: false, response_active: false, processed_calls: HashSet::new(), event_tags: std::collections::HashMap::new(), ring: VecDeque::with_capacity(16000*8) })),
             tools,
             policy,
             approval_prompt,
@@ -472,6 +502,16 @@ impl RealtimeManager {
             let model = opts.model.clone().unwrap_or_else(|| "gpt-realtime".to_string());
             g.status.model = Some(model.clone());
             g.status.last_error = None;
+            // Hard reset per-session state to avoid leftovers affecting the next call
+            g.playing_audio = false;
+            g.response_active = false;
+            g.assistant_flushed = false;
+            g.assistant_text_buf.clear();
+            g.assistant_pcm.clear();
+            g.user_text_buf.clear();
+            g.processed_calls.clear();
+            g.event_tags.clear();
+            g.ring.clear();
             drop(g);
 
             // Extract options to move into the async task
@@ -603,6 +643,8 @@ impl RealtimeManager {
                     }
                 } else { String::new() };
                 rt_log(format!("-> session.update {} bytes {}", upd_txt.len(), preview));
+                // Log state reset marker for diagnostics
+                rt_log("[state] session reset: response_active=false, buffers cleared");
                 if ws.send(Message::Text(upd_txt)).await.is_err() {
                     let mut g = inner.write();
                     g.status.last_error = Some("send session.update failed".into());

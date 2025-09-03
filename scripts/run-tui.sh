@@ -72,6 +72,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Always build the entire workspace to ensure all servers and bins are up to date
+log "Building workspace (debug)"
+cargo build --workspace >/dev/null 2>&1 || true
+
 if check_ready; then
   log "assistant-core already running at $FOREMAN_BIND"
 else

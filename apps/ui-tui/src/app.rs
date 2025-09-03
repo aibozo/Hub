@@ -13,7 +13,7 @@ use self::net::EphemeralPrompt;
 use self::net::{CodexSession};
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Screen { Chat, Dashboard, Tasks, Memory, Tools, Codex, Reports, Settings }
+pub enum Screen { Chat, Dashboard, Tasks, Memory, Tools, Codex, Reports, Research, Settings }
 
 pub struct App {
     pub active: Screen,
@@ -85,6 +85,10 @@ pub struct App {
     pub steam_modal_open: bool,
     pub steam_list: Vec<(String, String)>, // (name, appid)
     pub steam_sel: usize,
+    // Research screen
+    pub research_results: Vec<String>,
+    pub research_sel: usize,
+    pub research_details: String,
 }
 
 impl Default for App {
@@ -151,6 +155,9 @@ impl Default for App {
             steam_modal_open: false,
             steam_list: vec![],
             steam_sel: 0,
+            research_results: vec![],
+            research_sel: 0,
+            research_details: String::new(),
         }
     }
 }
@@ -235,17 +242,15 @@ pub async fn run() -> anyhow::Result<()> {
             match ev {
                 ChatEvent::AssistantReply(reply) => {
                     app.chat_messages.push(ChatMsg { role: "assistant".into(), content: reply });
-                    app.chat_scroll = 0;
+                    // Do not force-scroll if user scrolled up; staying at bottom is implicit when chat_scroll==0
                 }
                 ChatEvent::StreamDelta(delta) => {
                     if let Some(last) = app.chat_messages.last_mut() {
                         if last.role == "assistant" { last.content.push_str(&delta); }
                     }
-                    app.chat_scroll = 0;
                 }
                 ChatEvent::ToolNote(line) => {
                     app.chat_messages.push(ChatMsg { role: "assistant".into(), content: line });
-                    app.chat_scroll = 0;
                 }
                 ChatEvent::StreamDone => { push_toast(&mut app, "Chat complete", ToastKind::Success); }
                 ChatEvent::Error(msg) => { push_toast(&mut app, msg, ToastKind::Error); }
@@ -276,11 +281,16 @@ pub async fn run() -> anyhow::Result<()> {
                         }
                         // Refresh chat messages from latest session so voice transcripts show up live
                         if let Ok(Some(sess)) = net::chat_latest().await {
+                            let prev_len = app.chat_messages.len();
                             if app.chat_session_id.as_deref() != Some(&sess.id) {
                                 app.chat_session_id = Some(sess.id.clone());
                             }
+                            let new_len = sess.messages.len();
                             app.chat_messages = sess.messages;
-                            app.chat_scroll = 0;
+                            // Do not reset scroll unless user is already at bottom and new messages arrived (implicit bottom)
+                            if new_len > prev_len {
+                                // If user is at bottom (offset==0), keep bottom by leaving chat_scroll as-is (0). If scrolled, preserve.
+                            }
                         }
                     }
                     Err(_) => {}
@@ -375,7 +385,7 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     match crate::keymap::resolve(k) {
                         crate::keymap::Hotkey::Quit => break Ok(()),
-                        crate::keymap::Hotkey::SwitchTab(i) => { app.active = match i { 0=>Screen::Chat,1=>Screen::Dashboard,2=>Screen::Tasks,3=>Screen::Memory,4=>Screen::Tools,5=>Screen::Codex,6=>Screen::Reports,_=>Screen::Settings }; },
+                        crate::keymap::Hotkey::SwitchTab(i) => { app.active = match i { 0=>Screen::Chat,1=>Screen::Dashboard,2=>Screen::Tasks,3=>Screen::Memory,4=>Screen::Tools,5=>Screen::Codex,6=>Screen::Reports,7=>Screen::Research,_=>Screen::Settings }; },
                         crate::keymap::Hotkey::ToggleHelp => { app.show_help = !app.show_help; },
                         crate::keymap::Hotkey::Refresh => { refresh_current(&mut app).await; },
                         crate::keymap::Hotkey::VoicePTT => {
@@ -529,6 +539,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 Screen::Tools => { if app.tool_tool_sel > 0 { app.tool_tool_sel -= 1; } }
                                 Screen::Memory => { if app.mem_sel > 0 { app.mem_sel -= 1; } }
                                 Screen::Codex => { if app.codex_sel > 0 { app.codex_sel -= 1; } }
+                                Screen::Research => { if app.research_sel > 0 { app.research_sel -= 1; } }
                                 _ => {}
                             }
                         },
@@ -541,22 +552,89 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                                 Screen::Memory => { if !app.mem_results.is_empty() { app.mem_sel = (app.mem_sel + 1).min(app.mem_results.len()-1); } }
                                 Screen::Codex => { if !app.codex_sessions.is_empty() { app.codex_sel = (app.codex_sel + 1).min(app.codex_sessions.len()-1); } }
+                                Screen::Research => { if !app.research_results.is_empty() { app.research_sel = (app.research_sel + 1).min(app.research_results.len()-1); } }
                                 _ => {}
                             }
                         },
                         // Plain-letter handlers removed to avoid stealing typing
-                        (KeyModifiers::NONE, KeyCode::Left) => { if let Screen::Tools = app.active { if app.tool_server_sel > 0 { app.tool_server_sel -= 1; app.tool_tool_sel = 0; } } },
-                        (KeyModifiers::NONE, KeyCode::Right) => { if let Screen::Tools = app.active { if !app.tools_list.is_empty() { app.tool_server_sel = (app.tool_server_sel + 1).min(app.tools_list.len()-1); app.tool_tool_sel = 0; } } },
+                        (KeyModifiers::NONE, KeyCode::Left) => {
+                            match app.active {
+                                Screen::Tools => { if app.tool_server_sel > 0 { app.tool_server_sel -= 1; app.tool_tool_sel = 0; } }
+                                Screen::Research => { if app.focus_ix > 0 { app.focus_ix -= 1; } }
+                                _ => {}
+                            }
+                        },
+                        (KeyModifiers::NONE, KeyCode::Right) => {
+                            match app.active {
+                                Screen::Tools => { if !app.tools_list.is_empty() { app.tool_server_sel = (app.tool_server_sel + 1).min(app.tools_list.len()-1); app.tool_tool_sel = 0; } }
+                                Screen::Research => { let max = 2; if (app.focus_ix as usize) < max { app.focus_ix += 1; } }
+                                _ => {}
+                            }
+                        },
                         (KeyModifiers::CONTROL, KeyCode::Char('k')) => { app.input.clear(); },
                         (KeyModifiers::NONE, KeyCode::Tab) => {
-                            let max = match app.active { Screen::Chat => 1, Screen::Dashboard => 3, Screen::Reports => 2, Screen::Tools => 4, Screen::Memory => 4, Screen::Codex => 2, _ => 1 };
+                            let max = match app.active { Screen::Chat => 1, Screen::Dashboard => 3, Screen::Reports => 2, Screen::Tools => 4, Screen::Memory => 4, Screen::Codex => 2, Screen::Research => 3, _ => 1 };
                             app.focus_ix = (app.focus_ix + 1) % max;
                         }
                         (KeyModifiers::SHIFT, KeyCode::BackTab) | (KeyModifiers::SHIFT, KeyCode::Tab) => {
-                            let max = match app.active { Screen::Chat => 1, Screen::Dashboard => 3, Screen::Reports => 2, Screen::Tools => 4, Screen::Memory => 4, Screen::Codex => 2, _ => 1 };
+                            let max = match app.active { Screen::Chat => 1, Screen::Dashboard => 3, Screen::Reports => 2, Screen::Tools => 4, Screen::Memory => 4, Screen::Codex => 2, Screen::Research => 3, _ => 1 };
                             app.focus_ix = (app.focus_ix + max - 1) % max;
                         }
+                        // Research screen quick actions (guarded to not steal typing elsewhere)
+                        (KeyModifiers::NONE, KeyCode::Char('d')) if app.active == Screen::Research => {
+                            #[cfg(feature = "http")]
+                            {
+                                if let Some(id) = app.research_results.get(app.research_sel).and_then(|row| row.split('|').next()).map(|s| s.trim().to_string()) {
+                                    let params = serde_json::json!({"id": id});
+                                    match net::call_tool("arxiv", "fetch_pdf", &params.to_string()).await {
+                                        Ok(_) => push_toast(&mut app, "Downloaded PDF", ToastKind::Success),
+                                        Err(e) => push_toast(&mut app, format!("download error: {}", e), ToastKind::Error),
+                                    }
+                                }
+                            }
+                        }
+                        (KeyModifiers::NONE, KeyCode::Char('b')) if app.active == Screen::Research => {
+                            #[cfg(feature = "http")]
+                            {
+                                match net::run_job("arxiv").await { Ok(()) => push_toast(&mut app, "arXiv brief started", ToastKind::Success), Err(e) => push_toast(&mut app, format!("brief error: {}", e), ToastKind::Error) }
+                            }
+                        }
                         (KeyModifiers::NONE, KeyCode::Enter) => {
+                            if let Screen::Research = app.active {
+                                #[cfg(feature = "http")]
+                                {
+                                    if app.input.trim().is_empty() {
+                                        if let Some(id) = app.research_results.get(app.research_sel).and_then(|row| row.split('|').next()).map(|s| s.trim().to_string()) {
+                                            let params = serde_json::json!({"id": id});
+                                            match net::call_tool("arxiv", "summarize", &params.to_string()).await {
+                                                Ok(s) => { app.research_details = s; }
+                                                Err(e) => push_toast(&mut app, format!("summarize error: {}", e), ToastKind::Error),
+                                            }
+                                        }
+                                    } else {
+                                        let q = app.input.trim().to_string();
+                                        let params = serde_json::json!({"query": q, "max_results": 25});
+                                        match net::call_tool("arxiv", "search", &params.to_string()).await {
+                                            Ok(s) => {
+                                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                                                    let rows = v.get("results").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                                                    let list: Vec<String> = rows.into_iter().map(|r| {
+                                                        let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                                                        let title = r.get("title").and_then(|x| x.as_str()).unwrap_or("");
+                                                        format!("{} | {}", id, title)
+                                                    }).collect();
+                                                    app.research_results = list;
+                                                    app.research_sel = 0;
+                                                    app.research_details.clear();
+                                                    app.status = "arXiv: search complete".into();
+                                                }
+                                            }
+                                            Err(e) => push_toast(&mut app, format!("search error: {}", e), ToastKind::Error),
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                             if app.editing_params {
                                 app.tool_params = app.input.clone();
                                 app.editing_params = false;
@@ -1246,7 +1324,7 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(header_block, header_area);
 
     // Tabs inside the header box, styled
-    let titles = ["Chat", "Dashboard", "Tasks", "System", "Tools", "Codex", "Reports", "Settings"].iter().enumerate().map(|(i, t)| {
+    let titles = ["Chat", "Dashboard", "Tasks", "System", "Tools", "Codex", "Reports", "Research", "Settings"].iter().enumerate().map(|(i, t)| {
         let label = format!(" {} {} ", i + 1, t);
         Line::from(Span::styled(label, if app.active as usize == i { theme::tab_active() } else { theme::tab_inactive() }))
     });
@@ -1267,6 +1345,7 @@ fn ui(f: &mut Frame, app: &App) {
         Screen::Tools => screens::tools::draw(f, inner[0], app),
         Screen::Codex => screens::codex::draw(f, inner[0], app),
         Screen::Reports => screens::reports::draw(f, inner[0], app),
+        Screen::Research => screens::research_arxiv::draw(f, inner[0], app),
         Screen::Settings => screens::settings::draw(f, inner[0], app),
     }
 
@@ -1728,6 +1807,13 @@ pub mod net {
         if !resp.status().is_success() { anyhow::bail!("tool failed: {}", resp.status()); }
         let v: serde_json::Value = resp.json().await?;
         Ok(serde_json::to_string_pretty(&v).unwrap_or_else(|_| "(result)".into()))
+    }
+
+    pub async fn run_job(job: &str) -> anyhow::Result<()> {
+        let client = reqwest::Client::new();
+        let resp = client.post(&format!("http://127.0.0.1:6061/api/schedules/run/{}", job)).send().await?;
+        if !resp.status().is_success() { anyhow::bail!(format!("run job {} failed: {}", job, resp.status())); }
+        Ok(())
     }
 
     // Reports (interim): browse storage/briefs via fs tools

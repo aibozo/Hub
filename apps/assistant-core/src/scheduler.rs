@@ -151,14 +151,38 @@ impl Scheduler {
         let path = briefs_dir.join(fname);
         let content = match kind {
             "arxiv" => {
-                let month = Local::now().format("%Y-%m").to_string();
-                let res = self.tools.invoke("arxiv", "top", json!({"month": month, "n": 5})).await.unwrap_or_else(|_| json!({"items": []}));
-                let items = res.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                let mut md = format!("# arXiv Top Papers ({})\n\n", date);
-                for it in items {
-                    let title = it.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    let id = it.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    md.push_str(&format!("- [{}] {}\n", id, title));
+                // Run research pipeline (bounded)
+                let budgets = crate::research::types::ResearchBudgets { max_papers: 12, max_title_chars: 160, max_summary_chars: 800 };
+                let params = crate::research::types::ResearchTaskParams { query: "recent arXiv cs.*".into(), categories: vec![], window_days: 3, limit: 25, budgets };
+                let mut bundle = crate::research::pipeline::run_pipeline(&self.tools, &params).await.unwrap_or_else(|_| crate::research::types::ReportBundle { kind: "research_report/v1".into(), topic: "arxiv".into(), generated_at: chrono::Utc::now().to_rfc3339(), sources: vec![] });
+                // Optional multiagent selection (env-gated)
+                if std::env::var("RESEARCH_MULTIAGENT").ok().as_deref() == Some("1") {
+                    let top_k: usize = std::env::var("RESEARCH_TOP_K").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+                    let shards: usize = std::env::var("RESEARCH_SHARDS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+                    let per_tokens: usize = std::env::var("RESEARCH_WORKER_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+                    let opts = crate::research::agents::orchestrator::OrchestratorOptions { shards, per_worker_tokens: per_tokens, top_k };
+                    let agg = crate::research::agents::orchestrator::orchestrate(&bundle, &opts);
+                    // Filter sources to selected ids, preserving order of selection
+                    let selected: std::collections::HashSet<String> = agg.selected_ids.iter().cloned().collect();
+                    let mut filtered: Vec<crate::research::types::PaperMini> = vec![];
+                    for id in agg.selected_ids.iter() {
+                        if let Some(p) = bundle.sources.iter().find(|p| &p.id == id) { filtered.push(p.clone()); }
+                    }
+                    if !filtered.is_empty() { bundle.sources = filtered; }
+                    // Write highlights to a sidecar file
+                    let hl_path = briefs_dir.join(format!("{}-{}-highlights.txt", date, kind));
+                    let _ = tokio::fs::write(&hl_path, agg.highlights.join("\n")).await;
+                }
+                // Sidecar JSON
+                let json_path = briefs_dir.join(format!("{}-{}.json", date, kind));
+                let _ = tokio::fs::write(&json_path, serde_json::to_vec_pretty(&bundle).unwrap_or_else(|_| b"{}".to_vec())).await;
+                // Deterministic markdown synthesis (no model here)
+                let mut md = format!("# arXiv Brief — {}\n\n", date);
+                for (i, p) in bundle.sources.iter().enumerate() {
+                    md.push_str(&format!("{}. {}\n", i+1, p.title));
+                    if !p.authors.is_empty() { md.push_str(&format!("   - Authors: {}\n", p.authors.join(", "))); }
+                    if let Some(u) = &p.html_url { md.push_str(&format!("   - Abs: {}\n", u)); }
+                    if let Some(u) = &p.pdf_url { md.push_str(&format!("   - PDF: {}\n", u)); }
                 }
                 md
             }

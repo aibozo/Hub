@@ -12,6 +12,9 @@ The memory plane preserves recall without destructive compaction by using layere
 - Event Log (SQLite): append-only records of steps, tool calls, outputs (hashed), approvals.
 - Atoms (facts/insights): `{type, text, vector, bm25_terms, tags, task_id, created_at}`.
 - Artifacts: files (reports, cached PDFs, screenshots) with `artifact://` URIs and checksums.
+  - Research artifacts:
+    - `research_report` → Markdown brief at `storage/briefs/<YYYY-MM-DD>-arxiv.md` (+ JSON sidecar)
+    - `research_bundle` → packed JSON bundle used for synthesis and traceability
 - Indices: Tantivy BM25 + HNSW/FAISS embeddings, namespaced by `/global`, `/task/<id>`, `/spec/*`.
 
 ## Task Working Memory
@@ -58,4 +61,3 @@ Event(id, task_id, kind, payload_json, created_at)
 ## Privacy
 
 - Redact secrets by policy; never embed raw secrets; keep artifacts out of prompts unless user approves.
-

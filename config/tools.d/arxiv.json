@@ -2,5 +2,6 @@
   "server": "arxiv",
   "tools": ["search", "fetch_pdf", "summarize", "top"],
   "transport": "stdio",
-  "bin": "python -m arxiv_server"
+  "bin": "./target/debug/mcp-arxiv",
+  "autostart": true
 }

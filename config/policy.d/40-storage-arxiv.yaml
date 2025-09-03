@@ -1,0 +1,5 @@
+# ArXiv storage write scope — restrict writes to storage subtrees
+write_whitelist:
+  - "storage/artifacts/papers/arxiv/"
+  - "storage/briefs/arxiv/"
+

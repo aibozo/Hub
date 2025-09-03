@@ -35,6 +35,7 @@ pub fn resolve(ev: KeyEvent) -> Hotkey {
         (KeyModifiers::NONE, KeyCode::F(6)) | (KeyModifiers::CONTROL, KeyCode::Char('6')) => Hotkey::SwitchTab(5),
         (KeyModifiers::NONE, KeyCode::F(7)) | (KeyModifiers::CONTROL, KeyCode::Char('7')) => Hotkey::SwitchTab(6),
         (KeyModifiers::NONE, KeyCode::F(8)) | (KeyModifiers::CONTROL, KeyCode::Char('8')) => Hotkey::SwitchTab(7),
+        (KeyModifiers::NONE, KeyCode::F(9)) | (KeyModifiers::CONTROL, KeyCode::Char('9')) => Hotkey::SwitchTab(8),
         // Some terminals don't send Ctrl with digits; add Alt as a reliable alternative
         (KeyModifiers::ALT, KeyCode::Char('1')) => Hotkey::SwitchTab(0),
         (KeyModifiers::ALT, KeyCode::Char('2')) => Hotkey::SwitchTab(1),
@@ -44,6 +45,7 @@ pub fn resolve(ev: KeyEvent) -> Hotkey {
         (KeyModifiers::ALT, KeyCode::Char('6')) => Hotkey::SwitchTab(5),
         (KeyModifiers::ALT, KeyCode::Char('7')) => Hotkey::SwitchTab(6),
         (KeyModifiers::ALT, KeyCode::Char('8')) => Hotkey::SwitchTab(7),
+        (KeyModifiers::ALT, KeyCode::Char('9')) => Hotkey::SwitchTab(8),
         (KeyModifiers::CONTROL, KeyCode::Char('h')) => Hotkey::ToggleHelp,
         (KeyModifiers::CONTROL, KeyCode::Char('r')) => Hotkey::Refresh,
         (KeyModifiers::CONTROL, KeyCode::Char('o')) => Hotkey::OpenReport,

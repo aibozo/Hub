@@ -794,6 +794,57 @@ fn build_tool_defs(tm: &crate::tools::ToolsManager) -> Vec<serde_json::Value> {
                         "additionalProperties": false
                     })
                 )
+            } else if server == "arxiv" && t == "search" {
+                (
+                    "Search arXiv. Provide a query and optional filters. Example: {\"query\":\"mixture-of-experts\",\"categories\":[\"cs.LG\"],\"from\":\"2025-09-01T00:00:00Z\",\"max_results\":25}".to_string(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query (keywords)."},
+                            "categories": {"type": "array", "items": {"type": "string"}, "description": "Optional category codes, e.g., cs.LG, cs.AI."},
+                            "from": {"type": "string", "description": "Optional ISO-8601 UTC lower bound for updated date (e.g., 2025-09-01T00:00:00Z)."},
+                            "max_results": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Limit results (1-50, default 25)."}
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    })
+                )
+            } else if server == "arxiv" && t == "top" {
+                (
+                    "Top recent papers for a month (first N by latest update). Example: {\"month\":\"2025-09\",\"n\":5}".to_string(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "month": {"type": "string", "description": "YYYY-MM month (defaults to current)."},
+                            "n": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Number of items to return (default 5)."}
+                        },
+                        "additionalProperties": false
+                    })
+                )
+            } else if server == "arxiv" && t == "fetch_pdf" {
+                (
+                    "Download a paper PDF by arXiv ID. Example: {\"id\":\"2509.01234\"}".to_string(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "arXiv id (YYMM.NNNNN or arXiv:YYMM.NNNNN)."}
+                        },
+                        "required": ["id"],
+                        "additionalProperties": false
+                    })
+                )
+            } else if server == "arxiv" && t == "summarize" {
+                (
+                    "Summarize a paper by arXiv ID (not implemented; will return an error for now). Example: {\"id\":\"2509.01234\"}".to_string(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "arXiv id (YYMM.NNNNN)."}
+                        },
+                        "required": ["id"],
+                        "additionalProperties": false
+                    })
+                )
             } else {
                 (
                     format!("Call {}.{} via Foreman MCP", server, t),

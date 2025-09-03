@@ -64,6 +64,12 @@ Environment overrides:
 - `FOREMAN_PROFILE`: set a profile name for multi‑home setups.
 - `FOREMAN_BIND`: core bind address, e.g. `127.0.0.1:6061`.
 
+Research (env toggles):
+- `RESEARCH_MULTIAGENT=1` enables worker/judge selection in the arXiv brief (opt‑in; default 0).
+- `RESEARCH_TOP_K=6` controls top‑K selection when multiagent is on.
+- `RESEARCH_SHARDS=2` and `RESEARCH_WORKER_TOKENS=512` tune sharding and per‑worker token budgets.
+  (arXiv MCP server uses live networking by default.)
+
 Policy overlays and tools:
 - `config/policy.d/*.yaml`: protect paths, write whitelist, approval keywords, env allowlist, limits, log redactions.
 - `config/tools.d/*.json`: MCP manifests (`server`, `tools`, `transport`, `bin`, optional `autostart`).

@@ -14,6 +14,18 @@ Foreman capabilities are provided by MCP servers. Each server is replaceable and
 - mcp-arxiv: query/date range search; fetch PDFs; cache summaries; “top N of month” with citation proxy; daily brief job.
 - mcp-news: curated feeds + dedup + category tags; daily brief; crisis alerts.
 
+### ArXiv MCP (Rust)
+
+- Server: `mcp-arxiv` (stdio), manifest at `config/tools.d/arxiv.json` (autostart enabled).
+- Tools (via core API):
+  - `POST /api/tools/arxiv/search` with `{ "params": { "query": "...", "max_results": 25, "categories": ["cs.AI"] } }`
+  - `POST /api/tools/arxiv/summarize` with `{ "params": { "id": "2501.01234" } }`
+  - `POST /api/tools/arxiv/fetch_pdf` with `{ "params": { "id": "2501.01234" } }` (writes under `storage/artifacts/papers/arxiv/` per policy)
+  - `POST /api/tools/arxiv/top` with `{ "params": { "month": "2025-01", "n": 5 } }`
+- Storage:
+  - PDFs under `storage/artifacts/papers/arxiv/<id>/<id>.pdf`
+  - Briefs under `storage/briefs/<YYYY-MM-DD>-arxiv.{md,json}`
+
 ## Media and Desktop
 
 - mcp-spotify: auth, now playing, queue, playlists.

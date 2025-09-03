@@ -31,6 +31,7 @@ Non-goals for v1: full GUI/mobile app, unconstrained desktop control, cloud-only
 - Voice: mic → VAD → STT → assistant-core → plan → gated tool calls (MCP) → results → memory update → TTS stream → audio output.
 - TUI: command → assistant-core → same flow. Approvals and Explain-This inlined as cards.
 - Schedulers: cron-like jobs trigger arXiv/news agents → cache summaries/artifacts → morning brief.
+  - Research pipeline: `arxiv.search` → filter/rank → pack bundle (budgets) → optional multiagent selection (workers+judge) → synthesize Markdown brief.
 
 ## Component Contracts
 
@@ -41,6 +42,7 @@ Non-goals for v1: full GUI/mobile app, unconstrained desktop control, cloud-only
   - MCP client with transport (stdio or WS) and tool registry from `config/tools.d/*`.
   - Policy gatekeeper that classifies actions (safe/warn/block) and enforces approvals and dry-runs.
 - Memory plane APIs: append events, write atoms, query/search (BM25 + vector), build context packs under token budget.
+- Research pipeline: bounded context packer enforcing per-stage budgets; multiagent selection is opt-in and uses strict token limits per worker.
 - Realtime V2V Bridge: feature-gated WS/WebRTC client that configures a `gpt-realtime` session, exposes core tools as JSON Schemas, and mediates tool-calls via the gatekeeper. Provides `/api/realtime/{start,stop,status}` and integrates with wake sentinel and TUI controls. See `REALTIME.md`.
   - Scheduler with timezone-aware cron expressions; task creation hooks; artifact URIs (`artifact://...`).
 - Concurrency model: tokio runtime, bounded channels for backpressure, per-task spans for tracing.

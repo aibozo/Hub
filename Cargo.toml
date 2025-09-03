@@ -12,5 +12,6 @@ members = [
   "mcp-servers/rust/git",
   "mcp-servers/rust/codex",
   "mcp-servers/rust/codex-mock",
+  "mcp-servers/rust/arxiv",
 ]
 resolver = "2"
