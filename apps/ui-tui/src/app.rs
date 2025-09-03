@@ -3,17 +3,17 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::{prelude::*, widgets::*};
 use std::time::{Instant, Duration};
-use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
+use unicode_width::UnicodeWidthChar;
 
 use crate::theme;
 use crate::screens;
 #[cfg(feature = "http")]
 use self::net::EphemeralPrompt;
 #[cfg(feature = "http")]
-use self::net::{CodexSession};
+use self::net::{CodexSession, AgentRow};
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub enum Screen { Chat, Dashboard, Tasks, Memory, Tools, Codex, Reports, Research, Settings }
+pub enum Screen { Chat, Dashboard, Tasks, Memory, Tools, Codex, Agents, Reports, Research, Settings }
 
 pub struct App {
     pub active: Screen,
@@ -74,6 +74,10 @@ pub struct App {
     pub codex_sessions: Vec<CodexSession>,
     pub codex_sel: usize,
     pub codex_detail: String,
+    // Agents screen
+    pub agents_rows: Vec<AgentRow>,
+    pub agents_sel: usize,
+    pub agents_detail: String,
     // Transient Ctrl-hold hints overlay
     pub ctrl_hints_until: Option<Instant>,
     // Project selection
@@ -147,6 +151,9 @@ impl Default for App {
             codex_sessions: vec![],
             codex_sel: 0,
             codex_detail: String::new(),
+            agents_rows: vec![],
+            agents_sel: 0,
+            agents_detail: String::new(),
             ctrl_hints_until: None,
             proj_list: vec![],
             proj_sel: 0,
@@ -216,6 +223,10 @@ pub async fn run() -> anyhow::Result<()> {
     app.mouse_capture = true;
     app.want_mouse_capture = true;
 
+    // Channel for background events (chat replies/stream) and Agents SSE logs
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+    let (agents_tx, mut agents_rx) = tokio::sync::mpsc::unbounded_channel::<AgentsEvent>();
+
     // Try fetch system digest && tasks when http feature present
     #[cfg(feature = "http")]
     {
@@ -230,11 +241,19 @@ pub async fn run() -> anyhow::Result<()> {
         if let Ok(st) = net::list_tool_status().await { app.tools_status = st.into_iter().collect(); }
         if let Ok(Some(sess)) = net::chat_latest().await { app.chat_session_id = Some(sess.id.clone()); app.chat_messages = sess.messages; app.status = format!("Loaded chat {}", &sess.id[..8]); }
         if let Ok(cs) = net::codex_sessions().await { app.codex_sessions = cs; if let Some(s) = app.codex_sessions.get(0) { if let Ok(d) = net::codex_session_detail(&s.session_id).await { app.codex_detail = d; } } }
+    if let Ok(alist) = net::agents_list().await { app.agents_rows = alist; if let Some(a) = app.agents_rows.get(0) { if let Ok(snap) = net::agent_get(&a.id).await { app.agents_detail = snap.events_text; } } }
+        // Start Agents SSE stream for first agent (best-effort)
+        if let Some(a) = app.agents_rows.get(0).cloned() {
+            let tx = agents_tx.clone();
+            tokio::spawn(async move {
+                let _ = net::agent_events_stream(&a.id, move |event, data| {
+                    let line = format!("{} {}", event, data);
+                    let _ = tx.send(AgentsEvent::Log(line));
+                }).await;
+            });
+        }
     }
-
-    // Channel for background events (chat replies/stream)
-    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
-
+    
     let res = loop {
         terminal.draw(|f| ui(f, &app))?;
         // Drain background events and update UI state
@@ -261,6 +280,13 @@ pub async fn run() -> anyhow::Result<()> {
                         push_toast(&mut app, "Voice: transcribed", ToastKind::Success);
                         app.status = "Voice: transcribed".into();
                     }
+                }
+            }
+        }
+        while let Ok(ev) = agents_rx.try_recv() {
+            match ev {
+                AgentsEvent::Log(line) => {
+                    if app.agents_detail.is_empty() { app.agents_detail = line; } else { app.agents_detail.push_str("\n"); app.agents_detail.push_str(&line); }
                 }
             }
         }
@@ -385,7 +411,7 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     match crate::keymap::resolve(k) {
                         crate::keymap::Hotkey::Quit => break Ok(()),
-                        crate::keymap::Hotkey::SwitchTab(i) => { app.active = match i { 0=>Screen::Chat,1=>Screen::Dashboard,2=>Screen::Tasks,3=>Screen::Memory,4=>Screen::Tools,5=>Screen::Codex,6=>Screen::Reports,7=>Screen::Research,_=>Screen::Settings }; },
+                        crate::keymap::Hotkey::SwitchTab(i) => { app.active = match i { 0=>Screen::Chat,1=>Screen::Dashboard,2=>Screen::Tasks,3=>Screen::Memory,4=>Screen::Tools,5=>Screen::Codex,6=>Screen::Agents,7=>Screen::Reports,8=>Screen::Research,_=>Screen::Settings }; },
                         crate::keymap::Hotkey::ToggleHelp => { app.show_help = !app.show_help; },
                         crate::keymap::Hotkey::Refresh => { refresh_current(&mut app).await; },
                         crate::keymap::Hotkey::VoicePTT => {
@@ -484,6 +510,53 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        crate::keymap::Hotkey::AgentsPauseResume => {
+                            if let Screen::Agents = app.active {
+                                #[cfg(feature = "http")]
+                                {
+                                    if let Some(a) = app.agents_rows.get(app.agents_sel).cloned() {
+                                        let action = if a.status == "Running" { net::agent_pause(&a.id).await } else { net::agent_resume(&a.id).await };
+                                        match action { Ok(()) => { push_toast(&mut app, "Toggled agent", ToastKind::Success); let _ = refresh_current(&mut app).await; }, Err(e) => push_toast(&mut app, format!("Agent toggle err: {}", e), ToastKind::Error) }
+                                    }
+                                }
+                            }
+                        }
+                        crate::keymap::Hotkey::AgentsNew => {
+                            if let Screen::Agents = app.active {
+                                #[cfg(feature = "http")]
+                                {
+                                    let title = app.input.trim().to_string();
+                                    if title.is_empty() { push_toast(&mut app, "Type a title in Input", ToastKind::Warn); }
+                                    else {
+                                        // Create a task and an agent bound to it; root from current project or under storage/dev/<slug>
+                                        let root = app.proj_current.clone().unwrap_or_else(|| format!("dev/{}", title.to_lowercase().replace(' ', "_")));
+                                        match net::create_task(&title).await {
+                                            Ok(task_id) => {
+                                                match net::agent_create(task_id, &title, &root, None, Some(1)).await {
+                                                    Ok(_row) => { push_toast(&mut app, "Agent created", ToastKind::Success); let _ = refresh_current(&mut app).await; },
+                                                    Err(e) => push_toast(&mut app, format!("Create agent err: {}", e), ToastKind::Error),
+                                                }
+                                            }
+                                            Err(e) => push_toast(&mut app, format!("Task create err: {}", e), ToastKind::Error),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        crate::keymap::Hotkey::AgentsReplan => {
+                            if let Screen::Agents = app.active {
+                                #[cfg(feature = "http")]
+                                {
+                                    if let Some(a) = app.agents_rows.get(app.agents_sel).cloned() {
+                                        let md = app.input.trim().to_string();
+                                        if md.is_empty() { push_toast(&mut app, "Type plan markdown in Input", ToastKind::Warn); }
+                                        else {
+                                            match net::agent_replan(&a.id, None, Some(&md)).await { Ok(()) => { push_toast(&mut app, "Replanned", ToastKind::Success); let _ = refresh_current(&mut app).await; }, Err(e) => push_toast(&mut app, format!("Replan err: {}", e), ToastKind::Error) }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         crate::keymap::Hotkey::FocusSearch => {
                             if let Screen::Memory = app.active {
                                 app.focus_ix = 0; // search
@@ -539,6 +612,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 Screen::Tools => { if app.tool_tool_sel > 0 { app.tool_tool_sel -= 1; } }
                                 Screen::Memory => { if app.mem_sel > 0 { app.mem_sel -= 1; } }
                                 Screen::Codex => { if app.codex_sel > 0 { app.codex_sel -= 1; } }
+                                Screen::Agents => { if app.agents_sel > 0 { app.agents_sel -= 1; } #[cfg(feature = "http")] { let _ = reload_agents_detail(&mut app).await; } }
                                 Screen::Research => { if app.research_sel > 0 { app.research_sel -= 1; } }
                                 _ => {}
                             }
@@ -552,6 +626,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 }
                                 Screen::Memory => { if !app.mem_results.is_empty() { app.mem_sel = (app.mem_sel + 1).min(app.mem_results.len()-1); } }
                                 Screen::Codex => { if !app.codex_sessions.is_empty() { app.codex_sel = (app.codex_sel + 1).min(app.codex_sessions.len()-1); } }
+                                Screen::Agents => { if !app.agents_rows.is_empty() { app.agents_sel = (app.agents_sel + 1).min(app.agents_rows.len()-1); } #[cfg(feature = "http")] { let _ = reload_agents_detail(&mut app).await; } }
                                 Screen::Research => { if !app.research_results.is_empty() { app.research_sel = (app.research_sel + 1).min(app.research_results.len()-1); } }
                                 _ => {}
                             }
@@ -573,11 +648,11 @@ pub async fn run() -> anyhow::Result<()> {
                         },
                         (KeyModifiers::CONTROL, KeyCode::Char('k')) => { app.input.clear(); },
                         (KeyModifiers::NONE, KeyCode::Tab) => {
-                            let max = match app.active { Screen::Chat => 1, Screen::Dashboard => 3, Screen::Reports => 2, Screen::Tools => 4, Screen::Memory => 4, Screen::Codex => 2, Screen::Research => 3, _ => 1 };
+                            let max = match app.active { Screen::Chat => 1, Screen::Dashboard => 3, Screen::Reports => 2, Screen::Tools => 4, Screen::Memory => 4, Screen::Codex => 2, Screen::Agents => 2, Screen::Research => 3, _ => 1 };
                             app.focus_ix = (app.focus_ix + 1) % max;
                         }
                         (KeyModifiers::SHIFT, KeyCode::BackTab) | (KeyModifiers::SHIFT, KeyCode::Tab) => {
-                            let max = match app.active { Screen::Chat => 1, Screen::Dashboard => 3, Screen::Reports => 2, Screen::Tools => 4, Screen::Memory => 4, Screen::Codex => 2, Screen::Research => 3, _ => 1 };
+                            let max = match app.active { Screen::Chat => 1, Screen::Dashboard => 3, Screen::Reports => 2, Screen::Tools => 4, Screen::Memory => 4, Screen::Codex => 2, Screen::Agents => 2, Screen::Research => 3, _ => 1 };
                             app.focus_ix = (app.focus_ix + max - 1) % max;
                         }
                         // Research screen quick actions (guarded to not steal typing elsewhere)
@@ -1112,33 +1187,32 @@ async fn handle_command(mut app: &mut App, cmd: String) {
         #[cfg(feature = "http")]
         {
             // Accept formats: "/tool server tool {json}" or "/tool server.tool {json}"
-            let mut server = String::new();
-            let mut tool = String::new();
-            let mut params = "{}".to_string();
             let trimmed = rest.trim();
-            if let Some((st, p)) = trimmed.split_once(' ') {
+            let (server, tool, params) = if let Some((st, p)) = trimmed.split_once(' ') {
                 // st may be "server tool" or "server.tool"
                 if let Some((s, t)) = st.split_once('.') {
-                    server = s.to_string();
-                    tool = t.to_string();
-                    params = p.trim().to_string();
+                    (s.to_string(), t.to_string(), p.trim().to_string())
                 } else {
                     let mut parts = st.split_whitespace();
-                    server = parts.next().unwrap_or("").to_string();
-                    tool = parts.next().unwrap_or("").to_string();
-                    params = p.trim().to_string();
+                    (
+                        parts.next().unwrap_or("").to_string(),
+                        parts.next().unwrap_or("").to_string(),
+                        p.trim().to_string(),
+                    )
                 }
             } else {
                 // Only st provided; no params
                 if let Some((s, t)) = trimmed.split_once('.') {
-                    server = s.to_string();
-                    tool = t.to_string();
+                    (s.to_string(), t.to_string(), "{}".to_string())
                 } else {
                     let mut parts = trimmed.split_whitespace();
-                    server = parts.next().unwrap_or("").to_string();
-                    tool = parts.next().unwrap_or("").to_string();
+                    (
+                        parts.next().unwrap_or("").to_string(),
+                        parts.next().unwrap_or("").to_string(),
+                        "{}".to_string(),
+                    )
                 }
-            }
+            };
             if server.is_empty() || tool.is_empty() { app.status = "usage: /tool <server>.<tool> {json}".into(); return; }
             match net::call_tool(&server, &tool, &params).await {
                 Ok(out) => { app.status = format!("ok: {}.{}", server, tool); push_toast(&mut app, format!("Ran {}.{}", server, tool), ToastKind::Success); app.active = Screen::Tools; app.tool_output_text = out; }
@@ -1226,6 +1300,22 @@ async fn refresh_current(mut app: &mut App) {
                 }
                 // Keep digest fresh for details fallback
                 if let Ok(d) = net::get_system_digest().await { app.sys_digest = d; }
+            }
+            Screen::Agents => {
+                if let Ok(list) = net::agents_list().await { app.agents_rows = list; }
+                if let Some(a) = app.agents_rows.get(app.agents_sel).cloned() {
+                    if let Ok(snap) = net::agent_get(&a.id).await {
+                        // Append artifacts list to runlog detail
+                        let mut body = snap.events_text;
+                        if let Ok(arts) = net::agent_artifacts(&a.id).await {
+                            body.push_str("\n\nArtifacts:\n");
+                            for ar in arts.iter().take(20) {
+                                body.push_str(&format!("- {} ({:?}, {:?})\n", ar.path, ar.mime, ar.bytes));
+                            }
+                        }
+                        app.agents_detail = body;
+                    }
+                }
             }
             Screen::Tools => {
                 if let Ok(lst) = net::list_tools().await { app.tools_list = lst; }
@@ -1324,7 +1414,7 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(header_block, header_area);
 
     // Tabs inside the header box, styled
-    let titles = ["Chat", "Dashboard", "Tasks", "System", "Tools", "Codex", "Reports", "Research", "Settings"].iter().enumerate().map(|(i, t)| {
+    let titles = ["Chat", "Dashboard", "Tasks", "System", "Tools", "Codex", "Agents", "Reports", "Research", "Settings"].iter().enumerate().map(|(i, t)| {
         let label = format!(" {} {} ", i + 1, t);
         Line::from(Span::styled(label, if app.active as usize == i { theme::tab_active() } else { theme::tab_inactive() }))
     });
@@ -1345,6 +1435,7 @@ fn ui(f: &mut Frame, app: &App) {
         Screen::Tools => screens::tools::draw(f, inner[0], app),
         Screen::Codex => screens::codex::draw(f, inner[0], app),
         Screen::Reports => screens::reports::draw(f, inner[0], app),
+        Screen::Agents => screens::agents::draw(f, inner[0], app),
         Screen::Research => screens::research_arxiv::draw(f, inner[0], app),
         Screen::Settings => screens::settings::draw(f, inner[0], app),
     }
@@ -1556,6 +1647,81 @@ pub mod net {
     pub async fn get_system_digest() -> anyhow::Result<String> {
         let d: Digest = reqwest::get("http://127.0.0.1:6061/api/system_map/digest").await?.json().await?;
         Ok(d.digest)
+    }
+
+    // --- Agents ---
+    #[derive(Deserialize, Clone, Debug)]
+    pub struct AgentRow { pub id: String, pub task_id: i64, pub title: String, pub status: String, pub created_at: String, pub updated_at: String }
+    #[derive(Deserialize, Clone, Debug)]
+    pub struct AgentSnapshot { pub agent: AgentRow, pub events: Vec<serde_json::Value> }
+    pub async fn agents_list() -> anyhow::Result<Vec<AgentRow>> {
+        let v: Vec<AgentRow> = reqwest::get("http://127.0.0.1:6061/api/agents").await?.json().await?;
+        Ok(v)
+    }
+    pub async fn agent_get(id: &str) -> anyhow::Result<SuperAgentSnapshot> {
+        let s: AgentSnapshot = reqwest::get(&format!("http://127.0.0.1:6061/api/agents/{}", id)).await?.json().await?;
+        Ok(SuperAgentSnapshot::from(s))
+    }
+    #[derive(Deserialize, Clone, Debug)]
+    pub struct AgentArtifact { pub id: i64, pub path: String, pub mime: Option<String>, pub bytes: Option<i64>, pub origin_url: Option<String> }
+    pub async fn agent_artifacts(id: &str) -> anyhow::Result<Vec<AgentArtifact>> {
+        let v: Vec<AgentArtifact> = reqwest::get(&format!("http://127.0.0.1:6061/api/agents/{}/artifacts", id)).await?.json().await?;
+        Ok(v)
+    }
+    pub async fn agent_pause(id: &str) -> anyhow::Result<()> {
+        let _ = reqwest::Client::new().post(&format!("http://127.0.0.1:6061/api/agents/{}/pause", id)).send().await?;
+        Ok(())
+    }
+    pub async fn agent_resume(id: &str) -> anyhow::Result<()> {
+        let _ = reqwest::Client::new().post(&format!("http://127.0.0.1:6061/api/agents/{}/resume", id)).send().await?;
+        Ok(())
+    }
+    pub async fn agent_abort(id: &str) -> anyhow::Result<()> {
+        let _ = reqwest::Client::new().post(&format!("http://127.0.0.1:6061/api/agents/{}/abort", id)).send().await?;
+        Ok(())
+    }
+    pub async fn agent_replan(id: &str, artifact_id: Option<i64>, content_md: Option<&str>) -> anyhow::Result<()> {
+        let body = serde_json::json!({"artifact_id": artifact_id, "content_md": content_md});
+        let _ = reqwest::Client::new().post(&format!("http://127.0.0.1:6061/api/agents/{}/replan", id)).json(&body).send().await?;
+        Ok(())
+    }
+    #[derive(Deserialize, Clone, Debug)]
+    pub struct CreateTaskResp { pub id: i64 }
+    pub async fn create_task(title: &str) -> anyhow::Result<i64> {
+        let body = serde_json::json!({"title": title, "status": "open"});
+        let resp = reqwest::Client::new().post("http://127.0.0.1:6061/api/tasks").json(&body).send().await?;
+        if !resp.status().is_success() { anyhow::bail!(format!("task http {}", resp.status())); }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v.get("id").and_then(|x| x.as_i64()).unwrap_or(0))
+    }
+    #[derive(Deserialize, Clone, Debug)]
+    pub struct CreateAgentResp { pub id: String }
+    pub async fn agent_create(task_id: i64, title: &str, root_dir: &str, model: Option<&str>, auto_approval_level: Option<i64>) -> anyhow::Result<AgentRow> {
+        let body = serde_json::json!({
+            "task_id": task_id,
+            "title": title,
+            "root_dir": root_dir,
+            "model": model,
+            "auto_approval_level": auto_approval_level
+        });
+        let resp = reqwest::Client::new().post("http://127.0.0.1:6061/api/agents").json(&body).send().await?;
+        if !resp.status().is_success() { anyhow::bail!(format!("agent http {}", resp.status())); }
+        Ok(resp.json::<AgentRow>().await?)
+    }
+    #[derive(Clone, Debug)]
+    pub struct SuperAgentSnapshot { pub header: String, pub events_text: String }
+    impl From<AgentSnapshot> for SuperAgentSnapshot {
+        fn from(s: AgentSnapshot) -> Self {
+            let header = format!("{} [{}] — {}", &s.agent.id[..8.min(s.agent.id.len())], s.agent.status, s.agent.title);
+            let mut lines: Vec<String> = vec![header.clone(), String::new()];
+            for e in s.events.iter() {
+                let ts = e.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                let payload = e.get("payload").map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into())).unwrap_or_else(|| "{}".into());
+                lines.push(format!("[{}] {} {}", ts, kind, payload));
+            }
+            Self { header, events_text: lines.join("\n") }
+        }
     }
 
     pub async fn system_map_refresh() -> anyhow::Result<()> {
@@ -2107,6 +2273,37 @@ pub mod net {
         if !resp.status().is_success() { anyhow::bail!(format!("http {}", resp.status())); }
         Ok(())
     }
+
+    // Agents SSE
+    pub async fn agent_events_stream<F>(id: &str, mut on_event: F) -> anyhow::Result<()>
+    where F: FnMut(String, String) + Send + 'static {
+        let resp = reqwest::get(&format!("http://127.0.0.1:6061/api/agents/{}/events", id)).await?;
+        if !resp.status().is_success() { anyhow::bail!(format!("agents sse http {}", resp.status())); }
+        let mut stream = resp.bytes_stream();
+        let mut cur_event = String::new();
+        let mut cur_data = String::new();
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk?;
+            for line in String::from_utf8_lossy(&bytes).split('\n') {
+                let line = line.trim_end();
+                if line.starts_with("event:") {
+                    cur_event = line[6..].trim().to_string();
+                } else if line.starts_with("data:") {
+                    let d = line[5..].trim();
+                    if !cur_data.is_empty() { cur_data.push_str("\n"); }
+                    cur_data.push_str(d);
+                } else if line.is_empty() {
+                    if !cur_event.is_empty() {
+                        on_event(cur_event.clone(), cur_data.clone());
+                    }
+                    cur_event.clear();
+                    cur_data.clear();
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2117,6 +2314,9 @@ pub struct ChatMsg { pub role: String, pub content: String }
 
 #[derive(Clone, Debug)]
 enum ChatEvent { AssistantReply(String), StreamDelta(String), StreamDone, Error(String), ToolNote(String), VoiceTranscript(String) }
+// Extend background event channel with Agents log lines via SSE
+#[derive(Clone, Debug)]
+enum AgentsEvent { Log(String) }
 
 // Re-export types for ease in UI code
 pub use net::{MemHit, MemAtom};
@@ -2153,5 +2353,12 @@ async fn reload_codex(app: &mut App) {
 async fn reload_codex_detail(app: &mut App) {
     if let Some(s) = app.codex_sessions.get(app.codex_sel) {
         match net::codex_session_detail(&s.session_id).await { Ok(d) => app.codex_detail = d, Err(_) => {} }
+    }
+}
+
+#[cfg(feature = "http")]
+async fn reload_agents_detail(app: &mut App) {
+    if let Some(a) = app.agents_rows.get(app.agents_sel) {
+        if let Ok(snap) = net::agent_get(&a.id).await { app.agents_detail = snap.events_text; }
     }
 }

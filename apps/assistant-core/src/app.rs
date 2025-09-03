@@ -10,6 +10,7 @@ use crate::scheduler::{Scheduler, SchedulerConfig};
 use crate::gatekeeper::ProposedAction;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use crate::agents::AgentsSupervisor;
 
 #[derive(Clone)]
 pub struct AppHandles {
@@ -25,6 +26,7 @@ pub struct AppHandles {
     pub approval_prompt: Arc<RwLock<Option<EphemeralApproval>>>,
     pub realtime: RealtimeManager,
     pub wake: WakeSentinel,
+    pub agents: AgentsSupervisor,
 }
 
 #[derive(Clone)]
@@ -102,7 +104,7 @@ impl AppState {
         Arc::new(AppState {
             version: env!("CARGO_PKG_VERSION"),
             config: Arc::new(RwLock::new(config)),
-            handles: AppHandles { policy: policy.clone(), approvals, provenance, memory, system_map, tools, mcp_client: (), scheduler, approval_prompt, realtime, wake },
+            handles: AppHandles { policy: policy.clone(), approvals, provenance, memory, system_map, tools, mcp_client: (), scheduler, approval_prompt, realtime, wake, agents: AgentsSupervisor::new() },
         })
     }
 }

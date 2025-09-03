@@ -15,6 +15,7 @@ pub mod realtime_audio;
 pub mod wake;
 pub mod prompt;
 pub mod research;
+pub mod agents;
 #[cfg(feature = "wake-porcupine")]
 pub mod wake_porcupine;
 pub mod stt;

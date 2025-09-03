@@ -1,6 +1,7 @@
 use assistant_core::{api, app, config};
 use axum::{http::Request, body::{Body, to_bytes}};
 use tower::ServiceExt;
+use axum::http::StatusCode;
 
 #[tokio::test]
 async fn shell_list_and_read() {
@@ -39,4 +40,26 @@ async fn shell_list_and_read() {
     let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v.get("content").and_then(|s| s.as_str()), Some("world"));
+}
+
+#[tokio::test]
+async fn patch_apply_requires_approval() {
+    let state = app::AppState::new(config::Config::default()).await;
+    let app_router = api::build_router(state);
+    let body = serde_json::json!({"params": {"edits": [{"path": "./tmp.txt", "content": "hello"}]}}).to_string();
+    let resp = app_router.clone().oneshot(
+        Request::builder().method("POST").uri("/api/tools/patch/apply").header("content-type","application/json").body(Body::from(body)).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn git_commit_requires_approval() {
+    let state = app::AppState::new(config::Config::default()).await;
+    let app_router = api::build_router(state);
+    let body = serde_json::json!({"params": {"path": ".", "message": "test"}}).to_string();
+    let resp = app_router.clone().oneshot(
+        Request::builder().method("POST").uri("/api/tools/git/commit").header("content-type","application/json").body(Body::from(body)).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }

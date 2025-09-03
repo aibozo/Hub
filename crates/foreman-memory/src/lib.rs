@@ -82,6 +82,32 @@ pub struct ArtifactRow {
     pub origin_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Agent {
+    pub id: String,
+    pub task_id: i64,
+    pub title: String,
+    pub status: String,
+    pub plan_artifact_id: Option<i64>,
+    pub root_dir: String,
+    pub model: Option<String>,
+    pub servers_json: Option<String>,
+    pub auto_approval_level: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentIssue {
+    pub id: String,
+    pub agent_id: String,
+    pub severity: String,
+    pub title: String,
+    pub details_md: Option<String>,
+    pub action_required: bool,
+    pub ts: DateTime<Utc>,
+}
+
 impl MemoryStore {
     pub async fn new(db_path: &Path, migrations_dir: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() { std::fs::create_dir_all(parent)?; }
@@ -112,6 +138,26 @@ impl MemoryStore {
             r#"INSERT INTO Event(task_id, kind, payload_json) VALUES (?1, ?2, ?3) RETURNING id"#,
         )
         .bind(task_id)
+        .bind(kind)
+        .bind(payload)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("id"))
+    }
+
+    pub async fn append_event_for_agent(
+        &self,
+        task_id: Option<i64>,
+        agent_id: Option<&str>,
+        kind: &str,
+        payload_json: Option<&JsonValue>,
+    ) -> Result<i64> {
+        let payload = payload_json.map(|v| v.to_string());
+        let row = sqlx::query(
+            r#"INSERT INTO Event(task_id, agent_id, kind, payload_json) VALUES (?1, ?2, ?3, ?4) RETURNING id"#,
+        )
+        .bind(task_id)
+        .bind(agent_id)
         .bind(kind)
         .bind(payload)
         .fetch_one(&self.pool)
@@ -222,6 +268,27 @@ impl MemoryStore {
             .collect())
     }
 
+    pub async fn get_recent_events_by_agent(&self, agent_id: &str, limit: i64) -> Result<Vec<Event>> {
+        let rows = sqlx::query(
+            r#"SELECT id, task_id, kind, payload_json, created_at
+               FROM Event WHERE agent_id = ?1 ORDER BY id DESC LIMIT ?2"#,
+        )
+        .bind(agent_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Event {
+                id: r.get("id"),
+                task_id: r.get("task_id"),
+                kind: r.get("kind"),
+                payload_json: r.get("payload_json"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
     pub async fn create_artifact(&self, task_id: i64, path: &Path, mime: Option<&str>, sha256: Option<&str>) -> Result<i64> {
         let row = sqlx::query(
             r#"INSERT INTO Artifact(task_id, path, mime, sha256) VALUES (?1, ?2, ?3, ?4) RETURNING id"#,
@@ -233,6 +300,139 @@ impl MemoryStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.get::<i64, _>("id"))
+    }
+
+    pub async fn link_artifact_agent(&self, artifact_id: i64, agent_id: &str) -> Result<()> {
+        sqlx::query(r#"UPDATE Artifact SET agent_id = ?1 WHERE id = ?2"#)
+            .bind(agent_id)
+            .bind(artifact_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_agent(
+        &self,
+        id: &str,
+        task_id: i64,
+        title: &str,
+        status: &str,
+        root_dir: &str,
+        model: Option<&str>,
+        servers_json: Option<&str>,
+        auto_approval_level: i64,
+        plan_artifact_id: Option<i64>,
+    ) -> Result<Agent> {
+        let row = sqlx::query(
+            r#"INSERT INTO Agent(id, task_id, title, status, plan_artifact_id, root_dir, model, servers_json, auto_approval_level)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               RETURNING id, task_id, title, status, plan_artifact_id, root_dir, model, servers_json, auto_approval_level, created_at, updated_at"#,
+        )
+        .bind(id)
+        .bind(task_id)
+        .bind(title)
+        .bind(status)
+        .bind(plan_artifact_id)
+        .bind(root_dir)
+        .bind(model)
+        .bind(servers_json)
+        .bind(auto_approval_level)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Agent {
+            id: row.get("id"),
+            task_id: row.get("task_id"),
+            title: row.get("title"),
+            status: row.get("status"),
+            plan_artifact_id: row.get("plan_artifact_id"),
+            root_dir: row.get("root_dir"),
+            model: row.get("model"),
+            servers_json: row.get("servers_json"),
+            auto_approval_level: row.get("auto_approval_level"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+    }
+
+    pub async fn update_agent_status(&self, id: &str, status: &str) -> Result<()> {
+        sqlx::query(r#"UPDATE Agent SET status = ?1 WHERE id = ?2"#)
+            .bind(status)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_agent(&self, id: &str) -> Result<Option<Agent>> {
+        let row = sqlx::query(
+            r#"SELECT id, task_id, title, status, plan_artifact_id, root_dir, model, servers_json, auto_approval_level, created_at, updated_at
+               FROM Agent WHERE id = ?1"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| Agent {
+            id: r.get("id"),
+            task_id: r.get("task_id"),
+            title: r.get("title"),
+            status: r.get("status"),
+            plan_artifact_id: r.get("plan_artifact_id"),
+            root_dir: r.get("root_dir"),
+            model: r.get("model"),
+            servers_json: r.get("servers_json"),
+            auto_approval_level: r.get("auto_approval_level"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    pub async fn list_agents(&self, limit: i64) -> Result<Vec<Agent>> {
+        let rows = sqlx::query(
+            r#"SELECT id, task_id, title, status, plan_artifact_id, root_dir, model, servers_json, auto_approval_level, created_at, updated_at
+               FROM Agent ORDER BY updated_at DESC LIMIT ?1"#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Agent {
+                id: r.get("id"),
+                task_id: r.get("task_id"),
+                title: r.get("title"),
+                status: r.get("status"),
+                plan_artifact_id: r.get("plan_artifact_id"),
+                root_dir: r.get("root_dir"),
+                model: r.get("model"),
+                servers_json: r.get("servers_json"),
+                auto_approval_level: r.get("auto_approval_level"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    pub async fn append_agent_issue(
+        &self,
+        agent_id: &str,
+        severity: &str,
+        title: &str,
+        details_md: Option<&str>,
+        action_required: bool,
+    ) -> Result<String> {
+        let row = sqlx::query(
+            r#"INSERT INTO AgentIssue(agent_id, severity, title, details_md, action_required)
+               VALUES (?1, ?2, ?3, ?4, ?5)
+               RETURNING id"#,
+        )
+        .bind(agent_id)
+        .bind(severity)
+        .bind(title)
+        .bind(details_md)
+        .bind(if action_required { 1 } else { 0 })
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<String, _>("id"))
     }
 
     pub async fn get_atom_full(&self, id: i64) -> Result<Option<AtomFull>> {

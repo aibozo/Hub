@@ -132,6 +132,7 @@ impl ToolsManager {
             "fs" => invoke_fs(tool, params).await,
             "proc" => invoke_proc(tool, params).await,
             "git" => invoke_git(tool, params).await,
+            "patch" => invoke_patch(tool, params).await,
             "arxiv" => Err(anyhow::anyhow!("arxiv server not available (no stdio or spawn failed)")),
             "news" => invoke_news(tool, params).await,
             "installer" => invoke_installer(tool, params).await,
@@ -589,6 +590,19 @@ async fn invoke_fs(tool: &str, params: JsonValue) -> anyhow::Result<JsonValue> {
             entries.sort();
             Ok(json!({ "entries": entries }))
         }
+        "write_text" => {
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let create_dirs = params.get("create_dirs").and_then(|v| v.as_bool()).unwrap_or(true);
+            if path.is_empty() { anyhow::bail!("path required"); }
+            if path.contains("..") { anyhow::bail!("invalid path"); }
+            let p = std::path::Path::new(path);
+            if create_dirs {
+                if let Some(parent) = p.parent() { tokio::fs::create_dir_all(parent).await.ok(); }
+            }
+            tokio::fs::write(p, content.as_bytes()).await?;
+            Ok(json!({"ok": true}))
+        }
         "read" => {
             let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let content = tokio::fs::read_to_string(path).await?;
@@ -626,6 +640,66 @@ async fn invoke_git(tool: &str, params: JsonValue) -> anyhow::Result<JsonValue> 
             let ok = out.status.success();
             let changed = String::from_utf8_lossy(&out.stdout).lines().count();
             Ok(json!({ "repo": true, "ok": ok, "changed": changed }))
+        }
+        "branch" => {
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if name.is_empty() { anyhow::bail!("branch name required"); }
+            let out = tokio::process::Command::new("git")
+                .arg("-C").arg(path)
+                .arg("checkout").arg("-B").arg(name)
+                .output().await?;
+            let ok = out.status.success();
+            Ok(json!({"ok": ok}))
+        }
+        "add" => {
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let patterns = params.get("patterns").and_then(|v| v.as_array()).cloned().unwrap_or_else(|| vec![]);
+            let mut cmd = tokio::process::Command::new("git");
+            cmd.arg("-C").arg(path).arg("add");
+            if patterns.is_empty() { cmd.arg("-A"); } else {
+                for p in patterns { if let Some(s) = p.as_str() { cmd.arg(s); } }
+            }
+            let out = cmd.output().await?;
+            Ok(json!({"ok": out.status.success()}))
+        }
+        "commit" => {
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            if msg.is_empty() { anyhow::bail!("message required"); }
+            let out = tokio::process::Command::new("git")
+                .arg("-C").arg(path)
+                .arg("-c").arg("user.email=codex@example.com")
+                .arg("-c").arg("user.name=Codex")
+                .arg("commit").arg("-m").arg(msg)
+                .output().await?;
+            let ok = out.status.success();
+            Ok(json!({"ok": ok, "code": out.status.code()}))
+        }
+        _ => Err(anyhow::anyhow!("unknown tool")),
+    }
+}
+
+async fn invoke_patch(tool: &str, params: JsonValue) -> anyhow::Result<JsonValue> {
+    match tool {
+        "apply" => {
+            // Supported shape: { edits: [{ path, content, create_dirs? }] }
+            let edits = params.get("edits").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            if edits.is_empty() { anyhow::bail!("edits required"); }
+            let mut applied: Vec<String> = vec![];
+            for e in edits {
+                let path = e.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let content = e.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let create_dirs = e.get("create_dirs").and_then(|v| v.as_bool()).unwrap_or(true);
+                if path.is_empty() { anyhow::bail!("edit.path required"); }
+                if path.contains("..") { anyhow::bail!("invalid path"); }
+                let p = std::path::Path::new(path);
+                if create_dirs { if let Some(parent) = p.parent() { tokio::fs::create_dir_all(parent).await.ok(); } }
+                tokio::fs::write(p, content.as_bytes()).await?;
+                applied.push(path.to_string());
+                if applied.len() > 200 { anyhow::bail!("too many edits (max 200)"); }
+            }
+            Ok(json!({"ok": true, "applied": applied}))
         }
         _ => Err(anyhow::anyhow!("unknown tool")),
     }

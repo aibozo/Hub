@@ -68,6 +68,14 @@ Non-goals for v1: full GUI/mobile app, unconstrained desktop control, cloud-only
 - Hotkeys and slash-commands (e.g., `/voice`, `/install`, `/spec <dir>`), plus inline approval prompts.
 - Barge-in stop for TTS playback when space is pressed or wake word detected.
 
+### Agents (CTR)
+
+- Agent runtime inside `assistant-core/src/agents/*` manages long-running feature tasks with a resumable loop: Plan → Apply → Validate → Commit → Report.
+- Planning uses Codex MCP (best-effort) for diffs; all mutations flow through in-core gated tools (`patch.apply`, `git.*`).
+- Policy preflight before every step; “Warn/Hold” triggers an ephemeral approval prompt (and optional persisted approval token) surfaced in the TUI.
+- Events and artifacts are recorded with `agent_id` backrefs for runlogs and traceability.
+- HTTP API: `/api/agents{,/:id,/pause,/resume,/abort,/replan,/artifacts}`; a TUI “Agents” tab shows list and per-agent runlog.
+
 ## Storage and Data Model
 
 - SQLite tables: Task, TaskDigest, Atom, Artifact, Event (append-only event log).

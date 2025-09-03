@@ -62,6 +62,8 @@ Use this guide as your pinned context when contributing. It is dense by design: 
 
 - Path policies, env allowlists, timeouts, and dry-run behavior are mandatory. See `docs/POLICY.md`.
 - Risky actions require an approval token and must surface an Explain-This provenance card.
+- Agent write gates:
+  - `apply_patch` (core `patch.apply`) and `git commit` require approval unless policy returns Allow. Core surfaces an ephemeral prompt with reasons and affected paths, and accepts a persisted approval token for retries. See `config/policy.d/30-codex.yaml` and `docs/POLICY.md`.
 
 ## File/Code Conventions
 
@@ -154,13 +156,15 @@ Use this guide as your pinned context when contributing. It is dense by design: 
     - `/api/approval/prompt`, `/api/approval/answer`, `/api/approval/explain/:id`
     - `/api/chat/*` (sessions list/create/get/delete/append, complete/stream)
     - `/api/policy/check`, `/api/approvals*`, `/api/explain/:id`
+    - `/api/agents` (list/create), `/api/agents/:id` (snapshot), `/api/agents/:id/{pause|resume|abort|replan}`, `/api/agents/:id/artifacts`
   - Gatekeeper: wraps `crates/foreman-policy` with `ProposedAction -> PolicyDecision`; tracks approvals and provenance.
   - Memory: initializes file-backed SQLite under `storage/sqlite.db` with fallback to in-memory; emits Events on map changes and scheduler runs.
   - System Map: lightweight scanner with strict timeouts; persists `storage/map.json`; produces a compact digest for prompts.
   - Scheduler: computes next run from `schedules.toml`; writes briefs under `storage/briefs/` and logs memory events/artifacts.
   - Tools Manager: loads manifests, autostarts stdio servers, proxies tool calls; enforces `shell.exec` allowlist.
+  - Agents runtime (CTR): `src/agents/*` — state machine (Plan → Apply → Validate → Commit → Report). Planning via Codex MCP (best‑effort); edits via gated in‑core tools (`patch.apply`, `git.*`). Policy preflight before each step; ephemeral approvals when decision != Allow. Events/artifacts linked to `agent_id`.
 - UI TUI: `apps/ui-tui`
-  - Screens: Chat, Dashboard (health/metrics/schedules/reports), Tasks, Memory (search/card view/pack summary), Tools (invoke + params editor), Reports, Settings.
+  - Screens: Chat, Dashboard (health/metrics/schedules/reports), Tasks, Memory (search/card view/pack summary), Tools (invoke + params editor), Codex, Agents (list + runlog + actions), Reports, Settings.
   - Requires features: run with `--features tui,http` to enable HTTP calls to core.
 - MCP Servers
   - Rust stdio servers: `mcp-servers/rust/{shell,fs,proc,git}` with matching tools and policy enforcement.
@@ -176,6 +180,7 @@ Use this guide as your pinned context when contributing. It is dense by design: 
 - `docs/TOOLS.md`: server catalog, guardrails, manifests/transport.
 - `docs/TESTING.md`: test types, structure, CI matrix.
 - `docs/WIRING_MATRIX.md`: what is implemented vs wired; required for stubs.
+  - Agents quick links: `docs/ARCHITECTURE.md` (Agents (CTR)), `docs/POLICY.md` (Agent write approvals), `docs/TOOLS.md` (in-core tools), `docs/TESTING.md` (Agents tests).
 
 ## Build, Run, Test
 

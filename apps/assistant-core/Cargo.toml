@@ -39,6 +39,7 @@ tempfile = "3.10"
 axum = { version = "0.7", features = ["ws", "macros"] }
 tokio-tungstenite = { version = "0.21" }
 tungstenite = { version = "0.23" }
+http-body-util = "0.1"
 
 [lib]
 name = "assistant_core"

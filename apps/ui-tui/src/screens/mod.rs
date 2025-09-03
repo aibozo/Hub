@@ -8,3 +8,4 @@ pub mod dashboard;
 pub mod settings;
 pub mod codex;
 pub mod research_arxiv;
+pub mod agents;

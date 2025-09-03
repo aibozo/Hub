@@ -15,6 +15,7 @@ mod wake;
 mod stt;
 mod prompt;
 mod research;
+mod agents;
 
 use anyhow::Context;
 use axum::Router;

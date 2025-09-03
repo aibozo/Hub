@@ -23,8 +23,12 @@ This matrix specifies, for each subsystem, where it is implemented and where it 
   - Wires to: Core MCP registry (PR-0006), Policy checks (PR-0003), TUI Tools panel (PR-0008)
 
 - Codex MCP (CLI) Integration
-  - Implemented: PR-XXXX (this change)
-  - Wires to: Tools registry (adapter `mcp-codex`), Core API `/api/codex/{new,continue}`. TUI Codex tab pending (follow-up PR).
+  - Implemented: PR-0035
+  - Wires to: Tools registry (adapter `mcp-codex`), Core API `/api/codex/{new,continue}`; CTR runtime consumes progress (PR-0033), Agents API wrapper (PR-0036)
+
+- Agents (Codex Task Runner)
+  - Implemented: PR-0030, PR-0031, PR-0032, PR-0033, PR-0034, PR-0036
+  - Wires to: Policy (PR-0032/PR-0003), Memory (PR-0030), Tools (PR-0032), TUI (PR-0034), SSE (PR-0036)
 
 - Voice Daemon (TTS/STT/VAD/Wake)
   - Implemented: PR-0007

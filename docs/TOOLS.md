@@ -9,6 +9,20 @@ Foreman capabilities are provided by MCP servers. Each server is replaceable and
 - mcp-proc: list/kill/renice with safe defaults.
 - mcp-git: status, branches, worktrees, diff summaries, create/switch branch.
 
+### In-Core Tools (gated)
+
+These are executed inside `assistant-core` and exposed via the same `/api/tools/{server}/{tool}` surface:
+
+- `patch.apply` (server `patch`):
+  - Input: `{ "edits": [{ "path": "<file>", "content": "...", "create_dirs": true }] }`
+  - Guardrails: no `..` in paths; capped edits per call; approval gate via policy (`apply_patch`).
+- `fs.write_text` (server `fs`):
+  - Input: `{ "path": "<file>", "content": "...", "create_dirs": true }`
+  - For general writes; prefer `patch.apply` for multi-file edits.
+- `git.branch|add|commit` (server `git`):
+  - Inputs: `{ "path": "<repo root>", "name": "branch" }`, `{ "path": "<repo root>", "patterns": ["."] }`, `{ "path": "<repo root>", "message": "..." }`
+  - `commit` is approval-gated by policy.
+
 ## Research
 
 - mcp-arxiv: query/date range search; fetch PDFs; cache summaries; “top N of month” with citation proxy; daily brief job.
@@ -54,6 +68,7 @@ Foreman capabilities are provided by MCP servers. Each server is replaceable and
 ## Guardrails
 
 - Path policy enforcement, env allowlist, timeouts; no network scans by default; no escalations without core approval.
+- Approval gates: `patch.apply` and `git.commit` require an `approval_id`/`approve_token` unless policy returns `Allow`.
 
 ## Realtime Exposure
 

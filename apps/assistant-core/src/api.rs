@@ -18,6 +18,9 @@ use axum::extract::Path as AxPath;
 use reqwest::Client as HttpClient;
 use futures_util::StreamExt;
 use serde::Deserialize;
+use sqlx::Row;
+use uuid::Uuid;
+use crate::agents::AgentStatus;
 
 #[derive(Serialize)]
 struct Health {
@@ -81,6 +84,15 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/approval/prompt", get(get_approval_prompt))
         .route("/api/approval/answer", axum::routing::post(answer_approval))
         .route("/api/approval/explain/:id", get(explain_ephemeral))
+        .route("/api/agents/:id/events", get(agent_events_sse))
+        // agents
+        .route("/api/agents", axum::routing::post(agent_create).get(agent_list))
+        .route("/api/agents/:id", get(agent_get))
+        .route("/api/agents/:id/pause", axum::routing::post(agent_pause))
+        .route("/api/agents/:id/resume", axum::routing::post(agent_resume))
+        .route("/api/agents/:id/abort", axum::routing::post(agent_abort))
+        .route("/api/agents/:id/replan", axum::routing::post(agent_replan))
+        .route("/api/agents/:id/artifacts", get(agent_artifacts))
         // chat sessions
         .route("/api/chat/sessions", get(chat_sessions_list).post(chat_sessions_create))
         .route("/api/chat/sessions/latest", get(chat_sessions_latest))
@@ -138,6 +150,265 @@ async fn handle_ws(mut socket: WebSocket) {
 
 #[derive(Serialize)]
 struct ApiError { message: String }
+
+// ---- Agents API ----
+
+#[derive(serde::Deserialize)]
+struct AgentCreateReq {
+    task_id: i64,
+    title: String,
+    root_dir: String,
+    plan_artifact_id: Option<i64>,
+    model: Option<String>,
+    auto_approval_level: Option<i64>,
+    servers: Option<Vec<String>>,
+}
+
+#[derive(serde::Serialize)]
+struct AgentRow {
+    id: String,
+    task_id: i64,
+    title: String,
+    status: String,
+    plan_artifact_id: Option<i64>,
+    root_dir: String,
+    model: Option<String>,
+    auto_approval_level: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+async fn agent_create(State(state): State<SharedState>, Json(req): Json<AgentCreateReq>) -> impl IntoResponse {
+    let mem = match state.handles.memory.as_ref() { Some(m) => m, None => return (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { message: "memory not initialized".into() })).into_response() };
+    let id = Uuid::new_v4().to_string();
+    let servers_json = req.servers.as_ref().map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()));
+    match mem.store.create_agent(
+        &id,
+        req.task_id,
+        &req.title,
+        "Draft",
+        &req.root_dir,
+        req.model.as_deref(),
+        servers_json.as_deref(),
+        req.auto_approval_level.unwrap_or(1),
+        req.plan_artifact_id,
+    ).await {
+        Ok(a) => {
+            state.handles.agents.set_status(&a.id, AgentStatus::Draft);
+            let _ = mem.store.append_event_for_agent(Some(a.task_id), Some(&a.id), "agent.created", None).await;
+            Json(AgentRow {
+                id: a.id,
+                task_id: a.task_id,
+                title: a.title,
+                status: a.status,
+                plan_artifact_id: a.plan_artifact_id,
+                root_dir: a.root_dir,
+                model: a.model,
+                auto_approval_level: a.auto_approval_level,
+                created_at: a.created_at.to_rfc3339(),
+                updated_at: a.updated_at.to_rfc3339(),
+            }).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(),
+    }
+}
+
+async fn agent_list(State(state): State<SharedState>) -> impl IntoResponse {
+    let mem = match state.handles.memory.as_ref() { Some(m) => m, None => return Json::<Vec<AgentRow>>(vec![]).into_response() };
+    match mem.store.list_agents(200).await {
+        Ok(v) => {
+            let out: Vec<AgentRow> = v.into_iter().map(|a| AgentRow {
+                id: a.id,
+                task_id: a.task_id,
+                title: a.title,
+                status: a.status,
+                plan_artifact_id: a.plan_artifact_id,
+                root_dir: a.root_dir,
+                model: a.model,
+                auto_approval_level: a.auto_approval_level,
+                created_at: a.created_at.to_rfc3339(),
+                updated_at: a.updated_at.to_rfc3339(),
+            }).collect();
+            Json(out).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(),
+    }
+}
+
+async fn agent_get(State(state): State<SharedState>, AxPath((id,)): AxPath<(String,)>) -> impl IntoResponse {
+    let mem = match state.handles.memory.as_ref() { Some(m) => m, None => return (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { message: "memory not initialized".into() })).into_response() };
+    match mem.store.get_agent(&id).await {
+        Ok(Some(a)) => {
+            // Pack a snapshot with last few events
+            let events = mem.store.get_recent_events_by_agent(&id, 100).await.unwrap_or_default();
+            #[derive(serde::Serialize)]
+            struct Snapshot { agent: AgentRow, events: Vec<serde_json::Value> }
+            let agent_row = AgentRow {
+                id: a.id,
+                task_id: a.task_id,
+                title: a.title,
+                status: a.status,
+                plan_artifact_id: a.plan_artifact_id,
+                root_dir: a.root_dir,
+                model: a.model,
+                auto_approval_level: a.auto_approval_level,
+                created_at: a.created_at.to_rfc3339(),
+                updated_at: a.updated_at.to_rfc3339(),
+            };
+            let events_json: Vec<serde_json::Value> = events.into_iter().map(|e| {
+                let payload_val = e.payload_json.as_ref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                serde_json::json!({
+                    "id": e.id, "kind": e.kind, "payload": payload_val, "ts": e.created_at.to_rfc3339()
+                })
+            }).collect();
+            Json(Snapshot { agent: agent_row, events: events_json }).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(ApiError { message: "not found".into() })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(),
+    }
+}
+
+async fn agent_set_status(state: &SharedState, id: &str, status: &str) -> Result<(), anyhow::Error> {
+    if let Some(mem) = state.handles.memory.as_ref() {
+        mem.store.update_agent_status(id, status).await?;
+        state.handles.agents.set_status(id, AgentStatus::from_str(status));
+        let task_id = mem.store.get_agent(id).await?.map(|a| a.task_id);
+        let _ = mem.store.append_event_for_agent(task_id, Some(id), &format!("agent.{}", status.to_lowercase()), None).await;
+        Ok(())
+    } else { anyhow::bail!("memory not initialized") }
+}
+
+async fn agent_pause(State(state): State<SharedState>, AxPath((id,)): AxPath<(String,)>) -> impl IntoResponse {
+    match agent_set_status(&state, &id, "Paused").await { Ok(()) => StatusCode::OK.into_response(), Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { message: e.to_string() })).into_response() }
+}
+async fn agent_resume(State(state): State<SharedState>, AxPath((id,)): AxPath<(String,)>) -> impl IntoResponse {
+    match agent_set_status(&state, &id, "Running").await {
+        Ok(()) => {
+            crate::agents::runtime::spawn(state.clone(), id.clone());
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { message: e.to_string() })).into_response()
+    }
+}
+async fn agent_abort(State(state): State<SharedState>, AxPath((id,)): AxPath<(String,)>) -> impl IntoResponse {
+    match agent_set_status(&state, &id, "Aborted").await { Ok(()) => StatusCode::OK.into_response(), Err(e) => (StatusCode::BAD_REQUEST, Json(ApiError { message: e.to_string() })).into_response() }
+}
+
+#[derive(serde::Deserialize)]
+struct AgentReplanReq { artifact_id: Option<i64>, content_md: Option<String> }
+
+async fn agent_replan(State(state): State<SharedState>, AxPath((id,)): AxPath<(String,)>, Json(req): Json<AgentReplanReq>) -> impl IntoResponse {
+    let mem = match state.handles.memory.as_ref() { Some(m) => m, None => return (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { message: "memory not initialized".into() })).into_response() };
+    // Save content to storage if provided, else accept artifact_id
+    let plan_artifact_id = if let Some(md) = req.content_md.as_deref() {
+        // Write under storage/agents/<id>/plan.md
+        let storage_root = state.handles.system_map.map_path().parent().unwrap_or(std::path::Path::new("storage")).to_path_buf();
+        let dir = storage_root.join("agents").join(&id);
+        if let Err(e) = std::fs::create_dir_all(&dir) { return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(); }
+        let plan_path = dir.join("plan.md");
+        if let Err(e) = std::fs::write(&plan_path, md) { return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(); }
+        let task_id = mem.store.get_agent(&id).await.ok().and_then(|a| a.map(|a| a.task_id)).unwrap_or(0);
+        match mem.store.create_artifact(task_id, &plan_path, Some("text/markdown"), None).await {
+            Ok(aid) => { let _ = mem.store.link_artifact_agent(aid, &id).await; aid }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(),
+        }
+    } else if let Some(aid) = req.artifact_id { aid } else { return (StatusCode::BAD_REQUEST, Json(ApiError { message: "artifact_id or content_md required".into() })).into_response() };
+    // Update Agent.plan_artifact_id
+    if let Err(e) = sqlx::query("UPDATE Agent SET plan_artifact_id = ?1 WHERE id = ?2").bind(plan_artifact_id).bind(&id).execute(mem.store.pool()).await { return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(); }
+    let _ = mem.store.append_event_for_agent(None, Some(&id), "agent.replan", Some(&serde_json::json!({"plan_artifact_id": plan_artifact_id}))).await;
+    StatusCode::OK.into_response()
+}
+
+async fn agent_artifacts(State(state): State<SharedState>, AxPath((id,)): AxPath<(String,)>) -> impl IntoResponse {
+    let mem = match state.handles.memory.as_ref() { Some(m) => m, None => return Json::<Vec<serde_json::Value>>(vec![]).into_response() };
+    let rows = sqlx::query("SELECT id, path, mime, bytes, origin_url FROM Artifact WHERE agent_id = ?1 ORDER BY id DESC")
+        .bind(&id)
+        .fetch_all(mem.store.pool())
+        .await;
+    match rows {
+        Ok(rs) => {
+            let out: Vec<serde_json::Value> = rs.into_iter().map(|r| serde_json::json!({
+                "id": r.get::<i64,_>("id"),
+                "path": r.get::<String,_>("path"),
+                "mime": r.get::<Option<String>,_>("mime"),
+                "bytes": r.get::<Option<i64>,_>("bytes"),
+                "origin_url": r.get::<Option<String>,_>("origin_url"),
+            })).collect();
+            Json(out).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(),
+    }
+}
+
+// Agents SSE stream (status|issue|approval|artifact|log)
+async fn agent_events_sse(State(state): State<SharedState>, AxPath((id,)): AxPath<(String,)>) -> impl IntoResponse {
+    use tokio_stream::StreamExt;
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+    let mem = state.handles.memory.clone();
+    tokio::spawn(async move {
+        let pool = match mem.as_ref() { Some(m) => m.store.pool().clone(), None => { let _=tx.send("event: error\n".into()).await; let _=tx.send("data: {\"message\":\"memory not initialized\"}\n\n".into()).await; return; } };
+        // Initial backlog (last 50)
+        let mut last_id: i64 = 0;
+        if let Ok(rows) = sqlx::query("SELECT id, kind, payload_json, created_at FROM Event WHERE agent_id = ?1 ORDER BY id DESC LIMIT 50")
+            .bind(&id)
+            .fetch_all(&pool)
+            .await
+        {
+            let mut ordered = rows;
+            ordered.reverse();
+            for r in ordered.into_iter() {
+                last_id = last_id.max(r.get::<i64,_>("id"));
+                let kind: String = r.get("kind");
+                let evt = map_agent_evt(&kind);
+                let ts = r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339();
+                let payload: Option<String> = r.get("payload_json");
+                let data = serde_json::json!({"id": last_id, "kind": kind, "ts": ts, "payload": payload.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) });
+                let _ = tx.send(format!("event: {}\n", evt)).await;
+                let _ = tx.send(format!("data: {}\n\n", data)).await;
+            }
+        }
+        // Live tail
+        loop {
+            let q = sqlx::query("SELECT id, kind, payload_json, created_at FROM Event WHERE agent_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT 200")
+                .bind(&id)
+                .bind(last_id)
+                .fetch_all(&pool)
+                .await;
+            if let Ok(rows) = q {
+                for r in rows.into_iter() {
+                    last_id = last_id.max(r.get::<i64,_>("id"));
+                    let kind: String = r.get("kind");
+                    let evt = map_agent_evt(&kind);
+                    let ts = r.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339();
+                    let payload: Option<String> = r.get("payload_json");
+                    let data = serde_json::json!({"id": last_id, "kind": kind, "ts": ts, "payload": payload.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) });
+                    if tx.send(format!("event: {}\n", evt)).await.is_err() { return; }
+                    if tx.send(format!("data: {}\n\n", data)).await.is_err() { return; }
+                }
+            }
+            if tx.send("event: ping\n\n".into()).await.is_err() { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        }
+    });
+    let stream0 = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let stream = tokio_stream::StreamExt::map(stream0, |line| Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(line)));
+    let body = axum::body::Body::from_stream(stream);
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .body(body)
+        .unwrap()
+}
+
+fn map_agent_evt(kind: &str) -> &'static str {
+    if kind.starts_with("agent.approval") { "approval" }
+    else if kind.starts_with("agent.issue") { "issue" }
+    else if kind.starts_with("agent.") && (kind.ends_with("running") || kind.ends_with("paused") || kind.ends_with("done") || kind.ends_with("aborted")) { "status" }
+    else if kind.contains("artifact") { "artifact" }
+    else { "log" }
+}
 
 async fn list_tasks(State(state): State<SharedState>) -> impl IntoResponse {
     if let Some(mem) = state.handles.memory.as_ref() {
@@ -238,6 +509,44 @@ async fn call_tool(
     AxPath((server, tool)): AxPath<(String, String)>,
     Json(ToolParams { params }): Json<ToolParams>,
 ) -> impl IntoResponse {
+    // Policy/approval gating for risky tools
+    if (server.as_str(), tool.as_str()) == ("patch", "apply") {
+        // Preflight policy
+        let edits = params.get("edits").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let files: Vec<String> = edits.iter().filter_map(|e| e.get("path").and_then(|v| v.as_str()).map(|s| s.to_string())).collect();
+        let action = ProposedAction { command: "apply_patch".into(), writes: true, paths: files.clone(), intent: Some("apply code edits".into()) };
+        let decision = state.handles.policy.evaluate(&action);
+        if !matches!(decision.kind, crate::gatekeeper::PolicyDecisionKind::Allow) {
+            let approval_id = params.get("approval_id").and_then(|v| v.as_str());
+            let approve_token = params.get("approve_token").and_then(|v| v.as_str());
+            if approval_id.is_none() || approve_token.is_none() {
+                let title = "Apply patch requires approval".to_string();
+                let prompt = crate::app::EphemeralApproval { id: uuid::Uuid::new_v4().to_string(), title, action, details: serde_json::json!({"files": files, "reasons": decision.reasons}) };
+                *state.handles.approval_prompt.write() = Some(prompt);
+                return (StatusCode::CONFLICT, Json(ApiError { message: "approval required".into() })).into_response();
+            }
+            let ok = state.handles.approvals.validate_token(approval_id.unwrap(), approve_token.unwrap());
+            if !ok { return (StatusCode::FORBIDDEN, Json(ApiError { message: "invalid approval token".into() })).into_response(); }
+        }
+    }
+    if (server.as_str(), tool.as_str()) == ("git", "commit") {
+        let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let msg = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let action = ProposedAction { command: "git commit".into(), writes: true, paths: vec![path.to_string()], intent: Some(msg.into()) };
+        let decision = state.handles.policy.evaluate(&action);
+        if !matches!(decision.kind, crate::gatekeeper::PolicyDecisionKind::Allow) {
+            let approval_id = params.get("approval_id").and_then(|v| v.as_str());
+            let approve_token = params.get("approve_token").and_then(|v| v.as_str());
+            if approval_id.is_none() || approve_token.is_none() {
+                let title = format!("Git commit requires approval ({})", path);
+                let prompt = crate::app::EphemeralApproval { id: uuid::Uuid::new_v4().to_string(), title, action, details: serde_json::json!({"path": path, "message": msg, "reasons": decision.reasons}) };
+                *state.handles.approval_prompt.write() = Some(prompt);
+                return (StatusCode::CONFLICT, Json(ApiError { message: "approval required".into() })).into_response();
+            }
+            let ok = state.handles.approvals.validate_token(approval_id.unwrap(), approve_token.unwrap());
+            if !ok { return (StatusCode::FORBIDDEN, Json(ApiError { message: "invalid approval token".into() })).into_response(); }
+        }
+    }
     // Installer apply gating: if missing approval, interrupt with ephemeral prompt
     if server == "installer" && tool == "apply_install" {
         let plan_id = params.get("plan_id").and_then(|v| v.as_str());

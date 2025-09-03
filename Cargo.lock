@@ -101,6 +101,7 @@ dependencies = [
  "foreman-memory",
  "foreman-policy",
  "futures-util",
+ "http-body-util",
  "hyper",
  "once_cell",
  "parking_lot",

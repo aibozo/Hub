@@ -16,6 +16,7 @@ foreman/
 │
 ├─ apps/
 │  ├─ assistant-core/              # Rust orchestrator daemon (bin)
+│  │  └─ src/agents/               # Agents supervisor + CTR runtime (Plan→Apply→Validate→Commit→Report)
 │  └─ ui-tui/                      # Rust TUI (bin)
 │
 ├─ crates/                         # Shared Rust libs (clean seams)
@@ -36,6 +37,7 @@ foreman/
 │  ├─ foreman.toml                 # main config
 │  ├─ policy.d/{00-defaults.yaml,10-local-overrides.yaml}
 │  ├─ tools.d/{shell.json,fs.json,proc.json,git.json,arxiv.json,news.json,websearch.json,installer.json,emu.json,steam.json}
+│  ├─ agents.d.toml                # (optional) future: per-agent defaults (model, auto_approval)
 │  ├─ schedules.toml               # cron-like job times
 │  └─ tui.toml                     # theme, keymap
 │

@@ -35,7 +35,20 @@ This document defines how to structure and run tests across the Rust workspace a
 - Examples:
   - Voice WS playback test: connect to `/v1/tts/stream`, play a 1s tone, assert timely first chunk and graceful stop.
   - Installer dry-run: plan → explain → dry-run for a benign package; assert policy holds without approval.
-  - Memory pack: create tasks/atoms and verify context pack budgets and expansion ordering.
+- Memory pack: create tasks/atoms and verify context pack budgets and expansion ordering.
+
+### Agents Tests
+
+- `apps/assistant-core/tests/agents_memory.rs`: CRUD for `Agent`, event/artefact linking (in-memory DB).
+- `apps/assistant-core/tests/agents_api.rs`: API smoke tests (create/list non-panicking).
+- `apps/assistant-core/tests/agents_ctr.rs`: CTR runtime behavior:
+  - Auto-approval lane completes and writes `CTR_HELLO.txt` under `storage/`.
+  - Default lane pauses with an ephemeral approval prompt.
+  - Codex planning is best-effort: logs `agent.codex.session` or `agent.codex.unavailable`.
+
+### MCP Adapter Tests
+
+- `mcp-servers/rust/codex/tests/adapter.rs`: exercises the Codex stdio adapter (`mcp-codex`) against `codex-mock` and asserts that `session_id` is captured from notifications. Built in the workspace; runs offline.
 
 ## Test Data and Artifacts
 

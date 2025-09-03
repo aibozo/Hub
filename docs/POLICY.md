@@ -65,6 +65,15 @@ log_redactions:
 - Subprocess runner: sandbox cwd, ensure path/policy checks, pass only allowlisted env vars, apply timeouts/resource limits.
 - FS writes: require explicit allow under `write_whitelist`.
 
+### Agent Write Approvals
+
+- The following actions require approval by default (see `config/policy.d/30-codex.yaml`):
+  - `apply_patch` (core `patch.apply` tool)
+  - `git commit`
+- Core evaluates `ProposedAction { command, writes, paths[] }` and, if not `Allow`, surfaces an ephemeral prompt with reasons and affected files.
+- Upon approval, a token is issued and the original action is retried with `approval_id` + `approve_token`.
+- The TUI shows the prompt inline and can approve/deny, or fetch an Explain‑This card for provenance.
+
 ## Explain-This (Provenance)
 
 - For installs: show package origin, signature/hash, vendor links, and dry-run output.
@@ -73,4 +82,3 @@ log_redactions:
 ## Auditing
 
 - All actions are appended to Event log with unique approval tokens, timestamps, and normalized command lines.
-
