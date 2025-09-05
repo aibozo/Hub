@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Neutrals */
+  --bg:            #0b0f12;
+  --bg-elev-1:     #0f1418;
+  --bg-elev-2:     #12181d;
+  --surface:       #161d23;
+  --muted:         #8a94a1;
+  --text:          #e7edf3;
+  --text-dim:      #c2c9d1;
+  --border:        #1e2831;
+  --ring:          #2a3b46;
+
+  /* Teal accent */
+  --accent-50:     #083e3b;
+  --accent-100:    #0a4c48;
+  --accent-200:    #0f615b;
+  --accent-300:    #12756e;
+  --accent-400:    #128a81;
+  --accent-500:    #14b8a6;
+  --accent-600:    #0ea89a;
+  --accent-700:    #0b8c82;
+  --accent-800:    #0a6f67;
+  --accent-900:    #095953;
+
+  --ok:    #19c37d;
+  --warn:  #f4bf50;
+  --err:   #ff6b6b;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-size: var(--font-size-base, 15px);
+}
+
+* { box-sizing: border-box; }
+
+.focus-ring {
+  @apply focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[color:var(--accent-500)] focus:ring-offset-[color:var(--bg)];
+}
+
+/* Density tweaks: reduce padding slightly in compact mode */
+[data-density="compact"] .p-3 { padding: 0.6rem; }
+[data-density="compact"] .px-3 { padding-left: 0.6rem; padding-right: 0.6rem; }
+[data-density="compact"] .py-2 { padding-top: 0.35rem; padding-bottom: 0.35rem; }
+[data-density="compact"] .h-14 { height: 3.1rem; }
+
+/* Code ligatures toggle (future Monaco integration) */
+code, pre, textarea {
+  font-variant-ligatures: contextual;
+  font-feature-settings: "liga" var(--code-ligatures, 0);
+}

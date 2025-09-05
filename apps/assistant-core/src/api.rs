@@ -6,6 +6,8 @@ use axum::{
 };
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
+use axum::http::{header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue}, Method};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -21,6 +23,22 @@ use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 use crate::agents::AgentStatus;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+// Serialize chat session appends to avoid read-modify-write races
+static CHAT_APPEND_LOCK: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+// Per-session append locks to avoid cross-session serialization
+static CHAT_SESSION_LOCKS: Lazy<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = Lazy::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+async fn session_lock(id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = CHAT_SESSION_LOCKS.lock().await;
+    if let Some(l) = map.get(id) { return l.clone(); }
+    let l = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(id.to_string(), l.clone());
+    l
+}
 
 #[derive(Serialize)]
 struct Health {
@@ -29,6 +47,18 @@ struct Health {
 }
 
 pub fn build_router(state: SharedState) -> Router {
+    // CORS: allow local Next.js dev origin only (localhost:3000)
+    let allow_origins = [
+        HeaderValue::from_static("http://127.0.0.1:3000"),
+        HeaderValue::from_static("http://localhost:3000"),
+    ];
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(allow_origins))
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([CONTENT_TYPE, AUTHORIZATION])
+        .expose_headers([HeaderName::from_static("x-sse-event")])
+        .max_age(Duration::from_secs(60 * 60 * 24));
+
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -66,6 +96,8 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/codex/session/:id", get(codex_session_detail))
         // placeholder API endpoints for wiring in later PRs
         .route("/api/tasks", get(list_tasks).post(create_task))
+        .route("/api/tasks/:id/atoms", get(task_atoms))
+        .route("/api/tasks/:id/artifacts", get(task_artifacts))
         .route("/api/system_map", get(system_map))
         .route("/api/system_map/digest", get(system_map_digest))
         .route("/api/system_map/refresh", axum::routing::post(system_map_refresh))
@@ -106,6 +138,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/approvals/:id/approve", axum::routing::post(approve_approval))
         .route("/api/approvals/:id/deny", axum::routing::post(deny_approval))
         .route("/api/explain/:id", get(explain_action))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -435,6 +468,44 @@ async fn create_task(State(state): State<SharedState>, Json(req): Json<CreateTas
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { message: "memory not initialized".into() })).into_response()
     }
+}
+
+// List atoms for a task
+async fn task_atoms(State(state): State<SharedState>, Path(id): Path<i64>) -> impl IntoResponse {
+    if let Some(mem) = state.handles.memory.as_ref() {
+        match mem.store.get_atoms_by_task(id).await {
+            Ok(v) => return Json(v).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(),
+        }
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { message: "memory not initialized".into() })).into_response()
+}
+
+// List artifacts for a task
+async fn task_artifacts(State(state): State<SharedState>, Path(id): Path<i64>) -> impl IntoResponse {
+    if let Some(mem) = state.handles.memory.as_ref() {
+        let rows = sqlx::query("SELECT id, path, mime, bytes, origin_url FROM Artifact WHERE task_id = ?1 ORDER BY id DESC")
+            .bind(id)
+            .fetch_all(mem.store.pool())
+            .await;
+        return match rows {
+            Ok(rs) => {
+                let out: Vec<serde_json::Value> = rs
+                    .into_iter()
+                    .map(|r| serde_json::json!({
+                        "id": r.get::<i64,_>("id"),
+                        "path": r.get::<String,_>("path"),
+                        "mime": r.get::<Option<String>,_>("mime"),
+                        "bytes": r.get::<Option<i64>,_>("bytes"),
+                        "origin_url": r.get::<Option<String>,_>("origin_url"),
+                    }))
+                    .collect();
+                Json(out).into_response()
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(),
+        };
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(ApiError { message: "memory not initialized".into() })).into_response()
 }
 
 async fn system_map(State(state): State<SharedState>) -> impl IntoResponse {
@@ -1207,20 +1278,51 @@ async fn openai_chat_once(client: &HttpClient, key: &str, model: &str, messages:
 }
 
 #[derive(serde::Deserialize)]
-struct ChatStreamReq { messages: Vec<ChatMsg>, model: Option<String>, max_steps: Option<usize> }
+struct ChatStreamReq { messages: Vec<ChatMsg>, model: Option<String>, max_steps: Option<usize>, session_id: Option<String> }
 
 async fn chat_stream(State(state): State<SharedState>, Json(req): Json<ChatStreamReq>) -> impl IntoResponse {
-    let model = req.model.unwrap_or_else(|| std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5".into()));
-    let key = match std::env::var("OPENAI_API_KEY") { Ok(k) => k, Err(_) => return (StatusCode::BAD_REQUEST, "OPENAI_API_KEY not set").into_response() };
-    let client = HttpClient::new();
+    let model = req.model.clone().unwrap_or_else(|| std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-5".into()));
+    let mock_ok = req.model.as_deref() == Some("mock") || std::env::var("CHAT_MOCK").ok().as_deref() == Some("1");
+    let key = if mock_ok { String::new() } else { match std::env::var("OPENAI_API_KEY") { Ok(k) => k, Err(_) => return (StatusCode::BAD_REQUEST, "OPENAI_API_KEY not set").into_response() } };
+    let client = if mock_ok { HttpClient::new() } else { HttpClient::new() };
     let tools = build_tool_defs(&state.handles.tools);
     let max_steps = req.max_steps.unwrap_or(6);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
     let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({"role": "system", "content": system_prompt()})];
     messages.extend(req.messages.into_iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})));
+    let session_id = req.session_id.clone();
     tokio::spawn(async move {
+        // Optional assistant message id for this stream
+        let assistant_id = session_id.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+        // If persisting, create placeholder message
+        if let (Some(sid), Some(aid)) = (session_id.as_ref(), assistant_id.as_ref()) {
+            let path = chat_dir(&state).join(format!("{}.json", sid));
+            let lock = session_lock(sid).await;
+            let _g = lock.lock().await;
+            let mut s = match read_session(&path).await { Ok(s) => s, Err(_) => ChatSession { id: sid.clone(), messages: vec![] } };
+            let at = chrono::Utc::now().to_rfc3339();
+            s.messages.push(ChatMessage { id: aid.clone(), role: "assistant".to_string(), content: String::new(), at: Some(at) });
+            let _ = write_session(&path, &s).await;
+            let _ = tx.send("event: assistant_started\n".to_string()).await;
+            let _ = tx.send(format!("data: {}\n\n", serde_json::json!({"id": aid}))).await;
+        }
+
+        let mut assistant_acc = String::new();
         for _ in 0..max_steps {
+            if mock_ok {
+                // In mock mode, stream a simple assistant reply and break
+                // Create a small tokenized reply deterministically
+                if let (Some(_sid), Some(aid)) = (session_id.as_ref(), assistant_id.as_ref()) {
+                    let _ = tx.send("event: token\n".to_string()).await;
+                    let _ = tx.send(format!("data: {}\n\n", serde_json::json!({"id": aid, "text": "Hello"}))).await;
+                    assistant_acc.push_str("Hello");
+                    let _ = tx.send("event: token\n".to_string()).await;
+                    let _ = tx.send(format!("data: {}\n\n", serde_json::json!({"id": aid, "text": " world"}))).await;
+                    assistant_acc.push_str(" world");
+                }
+                break;
+            }
             match openai_chat_once(&client, &key, &model, &messages, &tools).await {
                 Ok(OnceResult::ToolCalls(calls, assistant_msg)) => {
                     let _ = tx.send(format!("event: tool_calls\n")).await;
@@ -1243,7 +1345,7 @@ async fn chat_stream(State(state): State<SharedState>, Json(req): Json<ChatStrea
                 }
                 Ok(OnceResult::Final(_)) => {
                     // Stream final tokens with OpenAI stream=true with no tools (to avoid further calls)
-                    if let Err(e) = openai_stream_tokens(&client, &key, &model, &messages, tx.clone()).await {
+                    if let Err(e) = openai_stream_tokens(&client, &key, &model, &messages, tx.clone(), assistant_id.as_deref(), &mut assistant_acc).await {
                         let _ = tx.send(format!("event: error\n")).await;
                         let _ = tx.send(format!("data: {}\n\n", serde_json::json!({"message": e.to_string()}))).await;
                     }
@@ -1254,6 +1356,18 @@ async fn chat_stream(State(state): State<SharedState>, Json(req): Json<ChatStrea
                     let _ = tx.send(format!("data: {}\n\n", serde_json::json!({"message": e.to_string()}))).await;
                     break;
                 }
+            }
+        }
+        // Persist assistant content if we have a session and placeholder id
+        if let (Some(sid), Some(aid)) = (session_id.as_ref(), assistant_id.as_ref()) {
+            let path = chat_dir(&state).join(format!("{}.json", sid));
+            let lock = session_lock(sid).await;
+            let _g = lock.lock().await;
+            if let Ok(mut s) = read_session(&path).await {
+                if let Some(m) = s.messages.iter_mut().find(|m| m.id == *aid) {
+                    m.content = assistant_acc.clone();
+                }
+                let _ = write_session(&path, &s).await;
             }
         }
         let _ = tx.send("event: done\n\n".to_string()).await;
@@ -1270,7 +1384,7 @@ async fn chat_stream(State(state): State<SharedState>, Json(req): Json<ChatStrea
         .unwrap()
 }
 
-async fn openai_stream_tokens(client: &HttpClient, key: &str, model: &str, messages: &Vec<serde_json::Value>, tx: tokio::sync::mpsc::Sender<String>) -> anyhow::Result<()> {
+async fn openai_stream_tokens(client: &HttpClient, key: &str, model: &str, messages: &Vec<serde_json::Value>, tx: tokio::sync::mpsc::Sender<String>, assistant_id: Option<&str>, acc: &mut String) -> anyhow::Result<()> {
     let body = serde_json::json!({"model": model, "messages": messages, "stream": true});
     let mut resp = client.post("https://api.openai.com/v1/chat/completions").bearer_auth(key).header("content-type","application/json").json(&body).send().await?;
     if !resp.status().is_success() { anyhow::bail!(format!("openai http {}", resp.status())); }
@@ -1291,8 +1405,10 @@ async fn openai_stream_tokens(client: &HttpClient, key: &str, model: &str, messa
                             if let Some(choice) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.get(0)) {
                                 if let Some(delta) = choice.get("delta") {
                                     if let Some(piece) = delta.get("content").and_then(|c| c.as_str()) {
+                                        acc.push_str(piece);
                                         let _ = tx.send("event: token\n".to_string()).await;
-                                        let _ = tx.send(format!("data: {}\n\n", piece)).await;
+                                        let payload = if let Some(id) = assistant_id { serde_json::json!({"id": id, "text": piece}) } else { serde_json::json!({"text": piece}) };
+                                        let _ = tx.send(format!("data: {}\n\n", payload)).await;
                                     }
                                 }
                             }
@@ -1307,7 +1423,13 @@ async fn openai_stream_tokens(client: &HttpClient, key: &str, model: &str, messa
 
 // ---- Chat session persistence ----
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct ChatMessage { role: String, content: String, at: Option<String> }
+struct ChatMessage {
+    #[serde(default)]
+    id: String,
+    role: String,
+    content: String,
+    at: Option<String>,
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 struct ChatSession { id: String, messages: Vec<ChatMessage> }
@@ -1322,7 +1444,19 @@ fn chat_dir(state: &SharedState) -> std::path::PathBuf {
 
 async fn read_session(path: &std::path::Path) -> anyhow::Result<ChatSession> {
     let bytes = tokio::fs::read(path).await?;
-    Ok(serde_json::from_slice(&bytes)?)
+    let mut s: ChatSession = serde_json::from_slice(&bytes)?;
+    // Backfill missing message IDs for legacy sessions
+    let mut changed = false;
+    for m in s.messages.iter_mut() {
+        if m.id.is_empty() {
+            m.id = uuid::Uuid::new_v4().to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = write_session(path, &s).await;
+    }
+    Ok(s)
 }
 
 async fn write_session(path: &std::path::Path, s: &ChatSession) -> anyhow::Result<()> {
@@ -1381,6 +1515,7 @@ async fn chat_sessions_create(State(state): State<SharedState>) -> impl IntoResp
     let id = uuid::Uuid::new_v4().to_string();
     let s = ChatSession { id: id.clone(), messages: vec![] };
     let path = chat_dir(&state).join(format!("{}.json", id));
+    let _g = CHAT_APPEND_LOCK.lock().await;
     if let Err(e) = write_session(&path, &s).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response();
     }
@@ -1399,11 +1534,15 @@ async fn chat_session_get(State(state): State<SharedState>, Path(id): Path<Strin
 struct AppendReq { role: String, content: String }
 async fn chat_session_append(State(state): State<SharedState>, Path(id): Path<String>, Json(req): Json<AppendReq>) -> impl IntoResponse {
     let path = chat_dir(&state).join(format!("{}.json", id));
+    // Serialize concurrent appends per-session to avoid lost updates
+    let l = session_lock(&id).await;
+    let _g = l.lock().await;
     let mut s = match read_session(&path).await { Ok(s) => s, Err(_) => ChatSession { id: id.clone(), messages: vec![] } };
     let at = chrono::Utc::now().to_rfc3339();
-    s.messages.push(ChatMessage { role: req.role, content: req.content, at: Some(at) });
+    let msg = ChatMessage { id: uuid::Uuid::new_v4().to_string(), role: req.role, content: req.content, at: Some(at) };
+    s.messages.push(msg.clone());
     match write_session(&path, &s).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) => Json(msg).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiError { message: e.to_string() })).into_response(),
     }
 }
