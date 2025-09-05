@@ -67,6 +67,7 @@ foreman/
 │  └─ pack-assets.sh
 │
 ├─ .github/workflows/{ci.yml,lint.yml}
+├─ web/                             # Local Web UI (Next.js) — consumes assistant-core API
 └─ pwa/                             # (later) Next.js bridge (optional)
 ```
 
