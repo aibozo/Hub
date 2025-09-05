@@ -30,3 +30,14 @@ Realtime Series (post-0017):
 - PR-0022 — Realtime WebRTC Transport (optional)
 
 See `docs/WIRING_MATRIX.md` for subsystem ↔ wiring PR mapping.
+
+Web UI Series (local browser app):
+
+1. PR-0200 — Web UI Enablement: CORS & Policy
+2. PR-0201 — Web UI Scaffold, Theme, Health
+3. PR-0202 — Web UI Chat MVP (Sessions, POST‑SSE Streaming)
+4. PR-0203 — Web UI Approvals Inline (Gatekeeper Flow)
+5. PR-0204 — Web UI Agents (List, Detail, Actions, Use in Chat)
+6. PR-0205 — Web UI Research (Tasks, Drawer, Brief Triggers)
+7. PR-0206 — Web UI Settings & Theming
+8. PR-0207 — Web UI Final Integration & Wiring Completion

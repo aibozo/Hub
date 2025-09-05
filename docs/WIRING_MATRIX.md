@@ -93,3 +93,7 @@ This matrix specifies, for each subsystem, where it is implemented and where it 
 - Final Integration
   - Implemented: PR-0017
   - Wires to: Ensures all above are connected, removes temporary stubs/feature flags, verifies end-to-end tests.
+
+- Web UI (Next.js)
+  - Implemented: PR-0207
+  - Wires to: CORS enablement (PR-0200); Chat streaming (PR-0202); Approvals (PR-0203); Agents list/actions/replan (PR-0204); Research tasks/briefs (PR-0205); Settings/Theme (PR-0206). Runs alongside TUI against the same core.

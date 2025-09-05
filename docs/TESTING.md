@@ -66,3 +66,26 @@ This document defines how to structure and run tests across the Rust workspace a
 ## Performance and Health
 
 - Benchmarks (opt-in): voice first-audio latency; memory packer throughput; MCP round-trip latency.
+
+## Frontend (Web UI)
+
+The Web UI is a local Next.js app that consumes `assistant-core` HTTP + POST‑SSE endpoints.
+
+- Start core: `cargo run -p assistant-core` (or `bash scripts/run-web.sh` to start core and web together).
+- Start web: `cd web && npm install && npm run dev` (port 3000).
+- Configure base: set `NEXT_PUBLIC_API_BASE` in `web/.env.local` when core is not on `127.0.0.1:6061`.
+
+SSE and streaming
+
+- Chat uses POST‑SSE (`POST /api/chat/stream`). The frontend parses events from a `ReadableStream` and supports: `token`, `tool_calls`, `tool_call`, `tool_result`, `error`, `done`.
+- Agents events (SSE) stream via `GET /api/agents/:id/events` (emits `status`, `issue`, `approval`, `artifact`, `log`, `ping`).
+
+Unit tests and mocking
+
+- Mock `fetch` and feed a canned SSE byte stream into the `readSSE` async generator for streaming tests.
+- Keep tests deterministic; avoid sleeps; debounce inputs as needed.
+
+Accessibility checks
+
+- Verify keyboard traversal: tabs, composer (Enter/Shift+Enter), Command Palette (Cmd/Ctrl‑K), Esc to close overlays.
+- Ensure visible focus rings and live region announcements for streaming are present.
