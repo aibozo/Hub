@@ -892,7 +892,7 @@ async fn append_voice_summary(dir: &PathBuf, line: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn append_latest_chat_message(dir: &PathBuf, role: &str, content: &str) -> anyhow::Result<()> {
+pub async fn append_latest_chat_message(dir: &PathBuf, role: &str, content: &str) -> anyhow::Result<()> {
     // Find latest chat, or create one if none exist
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
@@ -913,23 +913,32 @@ async fn append_latest_chat_message(dir: &PathBuf, role: &str, content: &str) ->
         p
     } };
     let mut v: serde_json::Value = match tokio::fs::read(&path).await.ok().and_then(|b| serde_json::from_slice(&b).ok()) { Some(j) => j, None => serde_json::json!({"id":"","messages": []}) };
-    // Deduplicate: if the last message matches role+content, skip append
-    let is_dup = {
-        let last = v.get("messages").and_then(|m| m.as_array()).and_then(|arr| arr.last());
-        match last {
-            Some(m) => {
-                let same_role = m.get("role").and_then(|s| s.as_str()) == Some(role);
-                let last_content = m.get("content").and_then(|s| s.as_str()).unwrap_or("").trim();
-                let new_content = content.trim();
-                same_role && last_content == new_content
-            }
-            None => false,
-        }
-    };
-    if is_dup { return Ok(()); }
     let at = chrono::Utc::now().to_rfc3339();
-    let msg = serde_json::json!({"role": role, "content": content, "at": at});
-    v.as_object_mut().and_then(|o| o.get_mut("messages")).and_then(|m| m.as_array_mut()).map(|arr| arr.push(msg));
+    // Coalesce with the true last message only when roles match; else append
+    let updated = {
+        let arr_opt = v.as_object_mut().and_then(|o| o.get_mut("messages")).and_then(|m| m.as_array_mut());
+        if let Some(arr) = arr_opt {
+            if let Some(last) = arr.last_mut() {
+                let same_role = last.get("role").and_then(|s| s.as_str()) == Some(role);
+                if same_role {
+                    // Append delta to existing content (streaming coalesce). Prefer simple concatenation.
+                    let mut new_obj = last.as_object().cloned().unwrap_or_default();
+                    let existing = new_obj.get("content").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                    let merged = format!("{}{}", existing, content);
+                    new_obj.insert("content".into(), serde_json::Value::String(merged));
+                    new_obj.insert("at".into(), serde_json::Value::String(at.clone()));
+                    // Ensure id exists
+                    if new_obj.get("id").is_none() { new_obj.insert("id".into(), serde_json::Value::String(Uuid::new_v4().to_string())); }
+                    *last = serde_json::Value::Object(new_obj);
+                    true
+                } else { false }
+            } else { false }
+        } else { false }
+    };
+    if !updated {
+        let msg = serde_json::json!({"id": Uuid::new_v4().to_string(), "role": role, "content": content, "at": at});
+        v.as_object_mut().and_then(|o| o.get_mut("messages")).and_then(|m| m.as_array_mut()).map(|arr| arr.push(msg));
+    }
     let data = serde_json::to_vec_pretty(&v)?;
     tokio::fs::write(&path, data).await?;
     Ok(())
